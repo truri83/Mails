@@ -84,6 +84,7 @@ End Sub
 ' ===================================================================
 
 ' Kontakt suchen oder neu anlegen -> gibt KontaktID zurueck
+' v0.2: Nutzt ParseKontaktName fuer erweiterte Felder (Vorname, Nachname, etc.)
 Public Function GetOderErstelleKontakt(ByVal strName As String, _
                                         ByVal strEmail As String, _
                                         Optional ByVal strEmailTyp As String = "SMTP") As Long
@@ -110,7 +111,7 @@ Public Function GetOderErstelleKontakt(ByVal strName As String, _
     End If
     rs.Close: Set rs = Nothing
 
-    ' 2. Dann nach Name suchen
+    ' 2. Dann nach Anzeigename suchen
     Set rs = db.OpenRecordset( _
         "SELECT KontaktID FROM tblKontakte WHERE Anzeigename='" & SQLSafe(strName) & "'", dbOpenSnapshot)
     If Not rs.EOF Then
@@ -121,13 +122,31 @@ Public Function GetOderErstelleKontakt(ByVal strName As String, _
     End If
     rs.Close: Set rs = Nothing
 
-    ' 3. Neuen Kontakt anlegen
+    ' 3. Neuen Kontakt anlegen mit erweitertem Namens-Parsing
+    Dim kn As TypKontaktName
+    kn = ParseKontaktName(strName, strEmail)
+
+    ' Domain-basiertes Lernen: Institution von Geschwister-Kontakt uebernehmen
+    If kn.Institution = "" Then
+        Dim dictLern As Object
+        Set dictLern = LerneVonDomain(strEmail)
+        If dictLern.Exists("Institution") Then
+            kn.Institution = dictLern("Institution")
+        End If
+    End If
+
     Set rs = db.OpenRecordset("tblKontakte", dbOpenDynaset)
     With rs
         .AddNew
-        !Anzeigename = Left(strName, 255)
+        !Anzeigename = Left(IIf(kn.Anzeigename <> "", kn.Anzeigename, strName), 255)
         !Email = Left(strEmail, 255)
         !EmailTyp = Left(strEmailTyp, 10)
+        !Vorname = Left(Nz(kn.Vorname, ""), 100)
+        !Nachname = Left(Nz(kn.Nachname, ""), 100)
+        !Titel = Left(Nz(kn.Titel, ""), 50)
+        !Namenszusatz = Left(Nz(kn.Namenszusatz, ""), 100)
+        !Institution = Left(Nz(kn.Institution, ""), 255)
+        !Sortiername = Left(Nz(kn.Sortiername, ""), 255)
         !ErstelltAm = Now
         !AktualisiertAm = Now
         .Update
@@ -136,7 +155,8 @@ Public Function GetOderErstelleKontakt(ByVal strName As String, _
     End With
 
     rs.Close: Set rs = Nothing: Set db = Nothing
-    LogDebug "Neuer Kontakt: ID=" & lngID & " " & strEmail, "DAO"
+    LogDebug "Neuer Kontakt: ID=" & lngID & " " & strEmail & _
+             " [" & kn.Vorname & " " & kn.Nachname & "]", "DAO"
     GetOderErstelleKontakt = lngID
     Exit Function
 

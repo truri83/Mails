@@ -145,6 +145,13 @@ Private Sub Erstelle_tblKontakte()
         "  Anzeigename TEXT(255)," & _
         "  Email TEXT(255)," & _
         "  EmailTyp TEXT(10)," & _
+        "  Vorname TEXT(100)," & _
+        "  Nachname TEXT(100)," & _
+        "  Titel TEXT(50)," & _
+        "  Namenszusatz TEXT(100)," & _
+        "  Institution TEXT(255)," & _
+        "  Sortiername TEXT(255)," & _
+        "  KontaktTyp TEXT(20)," & _
         "  ErstelltAm DATETIME," & _
         "  AktualisiertAm DATETIME" & _
         ")"

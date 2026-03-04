@@ -56,9 +56,16 @@ Synchronisation von Microsoft Outlook-Mails in eine Access-Datenbank mit:
 | Feld | Typ | Beschreibung |
 |---|---|---|
 | KontaktID | AutoNumber PK | |
-| Anzeigename | Text(255) | |
+| Anzeigename | Text(255) | Original-Anzeigename |
 | Email | Text(255) | SMTP-Adresse |
 | EmailTyp | Text(10) | SMTP / EX |
+| Vorname | Text(100) | Geparst aus Anzeigename |
+| Nachname | Text(100) | Geparst aus Anzeigename |
+| Titel | Text(50) | Dr., Prof. Dr. etc. |
+| Namenszusatz | Text(100) | Mittlere Namensteile |
+| Institution | Text(255) | Aus Klammer oder E-Mail-Domain |
+| Sortiername | Text(255) | "Nachname, Vorname" |
+| KontaktTyp | Text(20) | Optional: Intern/Extern/System |
 | ErstelltAm | DateTime | |
 | AktualisiertAm | DateTime | |
 
@@ -165,14 +172,15 @@ Synchronisation von Microsoft Outlook-Mails in eine Access-Datenbank mit:
 
 | Modul | Zeilen* | Aufgabe |
 |---|---|---|
-| **modSchema** | ~280 | Tabellen-DDL (`CREATE TABLE`), Indizes, Standardkonfiguration |
-| **modGlobals** | ~120 | Konstanten, MAPI-Tags, globale Objekte, `Sleep`-API, Init/Cleanup |
-| **modCrypto** | ~130 | SHA256-Hash via Windows CryptoAPI + Mail-Hash-Generierung |
-| **modLogging** | ~100 | `SchreibeLog`, `LogInfo/Warn/Error/Debug`, Logfile (tagesbasiert) |
-| **modStringUtils** | ~200 | Betreff-Bereinigung, Dateinamen, Pfade, E-Mail-Validierung, SQL-Escaping |
-| **modOutlookConnect** | ~220 | Outlook/RDO Connect/Disconnect, SMTP-Auflösung, Ordner öffnen |
-| **modDAO** | ~350 | Datenzugriff: Kontakte, Emails, Threads, Ordner, Anhänge, Status |
-| **modSync** | ~400 | Sync-Orchestrierung: `SyncPosteingang`, `SyncOrdner`, Einzelmail-Verarbeitung |
+| **modSchema** | ~430 | Tabellen-DDL (`CREATE TABLE`), Indizes, Standardkonfiguration |
+| **modGlobals** | ~130 | Konstanten, MAPI-Tags, globale Objekte, `Sleep`-API, Init/Cleanup |
+| **modCrypto** | ~160 | SHA256-Hash via Windows CryptoAPI + Mail-Hash-Generierung |
+| **modLogging** | ~110 | `SchreibeLog`, `LogInfo/Warn/Error/Debug`, Logfile (tagesbasiert) |
+| **modStringUtils** | ~400 | Betreff, Dateinamen, Pfade, E-Mail, Capitalize, IsAlpha, Institution |
+| **modKontakte** | ~320 | Namens-Parsing, Geschlecht, Anrede, Institution, Domain-Lernen |
+| **modOutlookConnect** | ~300 | Outlook/RDO Connect/Disconnect, SMTP-Auflösung, Ordner öffnen |
+| **modDAO** | ~580 | Datenzugriff: Kontakte, Emails, Threads, Ordner, Anhänge, Status |
+| **modSync** | ~760 | Sync-Orchestrierung, Subfolder-Rekursion, Postfach-Sync |
 
 \* Ungefähre Zeilenanzahl
 
@@ -207,7 +215,9 @@ modSync.SyncOrdner("Postfach\Ordner", "Projekt", "Phase")
     │   ├─ modDAO.SpeichereEmailContent()   → tblEmailContent
     │   │
     │   ├─ modSync.VerarbeiteEmpfaenger()   → tblEmailEmpfaenger
-    │   │   └── modDAO.GetOderErstelleKontakt() je Empfänger
+    │   │   ├── modDAO.GetOderErstelleKontakt() je Empfänger
+    │   │   │     └── modKontakte.ParseKontaktName() + LerneVonDomain()
+    │   │   └── modKontakte.AktualisiereKontaktEmail() bei "Unbekannt"
     │   │
     │   ├─ modSync.VerarbeiteAnhaenge()     → tblEmailAnhaenge + Dateien
     │   │   └── Filter: Hidden=True ODER Type≠1 → nur Metadaten
@@ -227,9 +237,15 @@ modSync
   ├── modDAO
   │     ├── modCrypto
   │     ├── modStringUtils
+  │     ├── modKontakte
   │     └── modLogging
+  ├── modKontakte  (NEU v0.2)
   ├── modStringUtils
   ├── modCrypto
+  └── modLogging
+
+modKontakte (NEU v0.2)
+  ├── modStringUtils (CapitalizeWord, IsAlphaOnly, ExtrahiereInstitution...)
   └── modLogging
 
 modOutlookConnect
@@ -271,6 +287,7 @@ modOutlookTest (standalone – unabhängiges Testmodul)
    - modCrypto.bas
    - modLogging.bas
    - modStringUtils.bas
+   - modKontakte.bas   (NEU in v0.2)
    - modOutlookConnect.bas
    - modDAO.bas
    - modSync.bas
@@ -300,7 +317,12 @@ LoescheAlleTabellen               ' ACHTUNG: Löscht alle Daten!
 ' --- Sync ---
 SyncPosteingang                   ' Posteingang synchronisieren (Standard-Einstellungen)
 SyncPosteingang "FLIWAS", "Test", 50   ' Max 50 Mails, Projekt=FLIWAS
+SyncPosteingang "FLIWAS", "Test", 50, True  ' Mit Unterordnern
 SyncOrdner "Torsten.Kugler@rps.bwl.de\Posteingang\FLIWAS", "FLIWAS", "Prod"
+SyncOrdner "...\FLIWAS", "FLIWAS", "Prod", 100, True  ' Mit Unterordnern
+
+' --- Postfach-Sync (v0.2) ---
+SyncPostfach "Torsten.Kugler@rps.bwl.de", "Standard", "Standard"  ' Ganzes Postfach
 
 ' --- Ordnerstruktur ---
 SyncOrdnerStruktur 3              ' Alle Ordner bis Tiefe 3 in DB einlesen
@@ -316,10 +338,11 @@ SyncOrdnerStruktur 3              ' Alle Ordner bis Tiefe 3 in DB einlesen
 
 | Phase | Beschreibung | Status |
 |---|---|---|
-| **v0.1** | Schema + Grundmodule (8 .bas Dateien) | ← AKTUELL |
-| v0.2 | Erster Praxistest, Bugfixes | |
-| v0.3 | StatusPanel-Integration (Fortschrittsanzeige) | |
-| v0.4 | Queue-basierte Verarbeitung (Pause/Abbruch) | |
-| v0.5 | Inkrementeller Sync (nur neue Mails) | |
-| v0.6 | Formular: Sync-Steuerung + Ordnerauswahl | |
+| **v0.1** | Schema + Grundmodule (8 .bas Dateien) | ✅ |
+| **v0.2** | Kontakt-Erweiterung, Namens-Parsing, Subfolder-Sync, Domain-Lernen (9 Module) | ← AKTUELL |
+| v0.3 | CID/Inline-Bild-Auflösung, HTML-Content-Bereinigung | |
+| v0.4 | StatusPanel-Integration (Fortschrittsanzeige) | |
+| v0.5 | Queue-basierte Verarbeitung (Pause/Abbruch) | |
+| v0.6 | Inkrementeller Sync (nur neue Mails seit LetzterSync) | |
+| v0.7 | Formular: Sync-Steuerung + Ordnerauswahl | |
 | v1.0 | Produktionsreif | |

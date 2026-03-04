@@ -25,7 +25,8 @@ Option Explicit
 ' ---------------------------------------------------------------------------
 Public Sub SyncPosteingang(Optional ByVal strProjekt As String = "Standard", _
                             Optional ByVal strPhase As String = "Standard", _
-                            Optional ByVal lngMaxMails As Long = 0)
+                            Optional ByVal lngMaxMails As Long = 0, _
+                            Optional ByVal blnSubfolder As Boolean = False)
 
     If Not ConnectRDO() Then
         LogError "SyncPosteingang: Keine RDO-Verbindung", "SYNC"
@@ -45,7 +46,7 @@ Public Sub SyncPosteingang(Optional ByVal strProjekt As String = "Standard", _
         lngMaxMails = CLng(LeseConfig("MaxMailsProSync", "500"))
     End If
 
-    Call SyncFolder(objInbox, strProjekt, strPhase, lngMaxMails)
+    Call SyncFolder(objInbox, strProjekt, strPhase, lngMaxMails, blnSubfolder)
 
     Set objInbox = Nothing
 End Sub
@@ -57,7 +58,8 @@ End Sub
 Public Sub SyncOrdner(ByVal strOrdnerPfad As String, _
                        Optional ByVal strProjekt As String = "Standard", _
                        Optional ByVal strPhase As String = "Standard", _
-                       Optional ByVal lngMaxMails As Long = 0)
+                       Optional ByVal lngMaxMails As Long = 0, _
+                       Optional ByVal blnSubfolder As Boolean = False)
 
     Dim objFolder As Object
     Set objFolder = OeffneOrdner(strOrdnerPfad)
@@ -71,7 +73,7 @@ Public Sub SyncOrdner(ByVal strOrdnerPfad As String, _
         lngMaxMails = CLng(LeseConfig("MaxMailsProSync", "500"))
     End If
 
-    Call SyncFolder(objFolder, strProjekt, strPhase, lngMaxMails)
+    Call SyncFolder(objFolder, strProjekt, strPhase, lngMaxMails, blnSubfolder)
 
     Set objFolder = Nothing
 End Sub
@@ -79,11 +81,13 @@ End Sub
 
 ' ---------------------------------------------------------------------------
 ' KERN-ROUTINE: Ordner-Objekt synchronisieren
+' v0.2: Optional mit rekursiver Subfolder-Verarbeitung
 ' ---------------------------------------------------------------------------
 Public Sub SyncFolder(objFolder As Object, _
                        ByVal strProjekt As String, _
                        ByVal strPhase As String, _
-                       ByVal lngMaxMails As Long)
+                       ByVal lngMaxMails As Long, _
+                       Optional ByVal blnSubfolder As Boolean = False)
 
     On Error GoTo ErrHandler
 
@@ -213,6 +217,11 @@ NaechsteMail:
     Debug.Print "  Dauer       : " & Format((Timer - g_dtSyncStart) / 60, "0.0") & " min"
     Debug.Print "  Status      : " & strStatus
     Debug.Print String(70, "=")
+
+    ' --- Subfolder rekursiv verarbeiten (v0.2) ---
+    If blnSubfolder And Not g_blnAbbrechen Then
+        Call SyncSubfolder(objFolder, strProjekt, strPhase, lngMaxMails)
+    End If
 
     Set objItem = Nothing
     Exit Sub
@@ -366,6 +375,7 @@ End Function
 
 ' ---------------------------------------------------------------------------
 ' EMPFAENGER EINER MAIL VERARBEITEN
+' v0.2: Aktualisiert Kontakt-E-Mail wenn bisherige ungueltig
 ' ---------------------------------------------------------------------------
 Private Sub VerarbeiteEmpfaenger(objRDOMail As Object, ByVal lngEmailID As Long)
     On Error GoTo ErrHandler
@@ -392,6 +402,11 @@ Private Sub VerarbeiteEmpfaenger(objRDOMail As Object, ByVal lngEmailID As Long)
         ' Kontakt ermitteln/erstellen
         If IstGueltigeEmail(strEmail) Then
             lngKontaktID = GetOderErstelleKontakt(strName, strEmail)
+
+            ' v0.2: E-Mail aktualisieren wenn Kontakt noch "Unbekannt"-Adresse hat
+            If lngKontaktID > 0 Then
+                Call AktualisiereKontaktEmail(lngKontaktID, strEmail)
+            End If
         Else
             lngKontaktID = 0
         End If
@@ -617,4 +632,116 @@ Private Sub SyncOrdnerRekursiv(objParent As Object, _
         End If
     Next objSub
     On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
+' SUBFOLDER EINER MAIL-SYNC REKURSIV VERARBEITEN (v0.2)
+' ===========================================================================
+
+' Iteriert rekursiv ueber Unterordner und ruft SyncFolder fuer jeden auf.
+' Stoppt bei g_blnAbbrechen = True.
+Private Sub SyncSubfolder(objParent As Object, _
+                           ByVal strProjekt As String, _
+                           ByVal strPhase As String, _
+                           ByVal lngMaxMails As Long, _
+                           Optional ByVal intLevel As Integer = 1, _
+                           Optional ByVal intMaxDepth As Integer = 5)
+    If intLevel > intMaxDepth Then Exit Sub
+    If g_blnAbbrechen Then Exit Sub
+
+    On Error Resume Next
+    Dim objSub As Object
+
+    For Each objSub In objParent.Folders
+        If g_blnAbbrechen Then Exit For
+        If Err.Number <> 0 Then Err.Clear: GoTo NaechsterSub
+
+        ' Nur Ordner mit E-Mails (nicht Kalender, Kontakte etc.)
+        If objSub.DefaultItemType = olMail Then
+            Debug.Print String(intLevel * 2, " ") & "|- SYNC: " & objSub.Name & _
+                        " (" & objSub.Items.Count & " Elemente)"
+
+            On Error GoTo 0
+            Call SyncFolder(objSub, strProjekt, strPhase, lngMaxMails, False)
+            On Error Resume Next
+
+            ' Weitere Tiefe
+            If intLevel < intMaxDepth Then
+                Call SyncSubfolder(objSub, strProjekt, strPhase, lngMaxMails, _
+                                    intLevel + 1, intMaxDepth)
+            End If
+        End If
+
+NaechsterSub:
+    Next objSub
+
+    On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
+' GANZES POSTFACH SYNCHRONISIEREN (v0.2)
+' ===========================================================================
+
+' Synchronisiert alle Ordner eines Postfachs inkl. Unterordner.
+' Aufruf: SyncPostfach "Torsten.Kugler@rps.bwl.de", "FLIWAS", "Test"
+Public Sub SyncPostfach(ByVal strPostfachName As String, _
+                         Optional ByVal strProjekt As String = "Standard", _
+                         Optional ByVal strPhase As String = "Standard", _
+                         Optional ByVal lngMaxMailsProOrdner As Long = 0, _
+                         Optional ByVal intMaxTiefe As Integer = 5)
+    On Error GoTo ErrHandler
+
+    If Not ConnectRDO() Then
+        LogError "SyncPostfach: Keine RDO-Verbindung", "SYNC"
+        Exit Sub
+    End If
+
+    If lngMaxMailsProOrdner <= 0 Then
+        lngMaxMailsProOrdner = CLng(LeseConfig("MaxMailsProSync", "500"))
+    End If
+
+    ' Store finden
+    Dim objStore As Object
+    Dim blnGefunden As Boolean: blnGefunden = False
+
+    For Each objStore In g_objRDO.Stores
+        If InStr(1, objStore.DisplayName, strPostfachName, vbTextCompare) > 0 Then
+            blnGefunden = True
+            Exit For
+        End If
+    Next objStore
+
+    If Not blnGefunden Then
+        LogError "SyncPostfach: Store '" & strPostfachName & "' nicht gefunden", "SYNC"
+        Exit Sub
+    End If
+
+    Debug.Print String(70, "=")
+    Debug.Print "=== POSTFACH-SYNC: " & objStore.DisplayName & " ==="
+    Debug.Print "    Tiefe     : " & intMaxTiefe
+    Debug.Print "    Max/Ordner: " & lngMaxMailsProOrdner
+    Debug.Print "    " & Now()
+    Debug.Print String(70, "=")
+
+    g_blnAbbrechen = False
+    g_dtSyncStart = Timer
+
+    ' Root-Ordner und rekursiv alle Unterordner synchronisieren
+    Dim objRoot As Object
+    Set objRoot = objStore.RootFolder
+
+    Call SyncSubfolder(objRoot, strProjekt, strPhase, lngMaxMailsProOrdner, 1, intMaxTiefe)
+
+    Debug.Print String(70, "=")
+    Debug.Print "=== POSTFACH-SYNC ABGESCHLOSSEN ==="
+    Debug.Print "    Dauer: " & Format((Timer - g_dtSyncStart) / 60, "0.0") & " min"
+    Debug.Print String(70, "=")
+
+    Set objRoot = Nothing
+    Exit Sub
+
+ErrHandler:
+    LogVBAError "SyncPostfach"
 End Sub

@@ -258,3 +258,135 @@ End Function
 Public Function SQLSafe(ByVal strInput As String) As String
     SQLSafe = Replace(Nz(strInput, ""), "'", "''")
 End Function
+
+
+' ===========================================================================
+' CAPITALIZE / NAME-BEREINIGUNG (v0.2)
+' ===========================================================================
+
+' ---------------------------------------------------------------------------
+' WORT CAPITALISIEREN mit Sonder-Handling fuer Adelspraedikate
+' "von", "van", "de", "der", "den" bleiben klein
+' Unterstuetzt Bindestriche: "Mueller-Schmidt" -> "Mueller-Schmidt"
+' ---------------------------------------------------------------------------
+Public Function CapitalizeWord(ByVal strInput As String) As String
+    Dim partsSpace() As String, partsHyphen() As String
+    Dim i As Long, j As Long
+
+    strInput = Trim(strInput)
+    If Len(strInput) = 0 Then CapitalizeWord = "": Exit Function
+
+    partsSpace = Split(strInput, " ")
+    For i = LBound(partsSpace) To UBound(partsSpace)
+        partsHyphen = Split(partsSpace(i), "-")
+        For j = LBound(partsHyphen) To UBound(partsHyphen)
+            If Len(partsHyphen(j)) > 0 Then
+                Select Case LCase(partsHyphen(j))
+                    Case "von", "van", "de", "der", "den"
+                        partsHyphen(j) = LCase(partsHyphen(j))
+                    Case Else
+                        partsHyphen(j) = UCase(Left(partsHyphen(j), 1)) & LCase(Mid(partsHyphen(j), 2))
+                End Select
+            End If
+        Next j
+        partsSpace(i) = Join(partsHyphen, "-")
+    Next i
+
+    CapitalizeWord = Join(partsSpace, " ")
+End Function
+
+
+' ---------------------------------------------------------------------------
+' PRUEFEN OB NUR ALPHABETISCHE ZEICHEN + Umlaute + Bindestrich
+' ---------------------------------------------------------------------------
+Public Function IsAlphaOnly(ByVal strValue As String) As Boolean
+    Dim objRE As Object
+    Set objRE = CreateObject("VBScript.RegExp")
+    objRE.Pattern = "^[a-zA-ZaeoeueAeOeUess\-]+$"
+    objRE.IgnoreCase = True
+    objRE.Global = False
+    IsAlphaOnly = objRE.Test(Trim(strValue))
+    Set objRE = Nothing
+End Function
+
+
+' ---------------------------------------------------------------------------
+' DOMAIN AUS E-MAIL EXTRAHIEREN (z.B. "user@rps.bwl.de" -> "rps.bwl.de")
+' ---------------------------------------------------------------------------
+Public Function ExtrahiereDomain(ByVal strEmail As String) As String
+    If InStr(strEmail, "@") > 0 Then
+        ExtrahiereDomain = LCase(Split(strEmail, "@")(1))
+    Else
+        ExtrahiereDomain = ""
+    End If
+End Function
+
+
+' ---------------------------------------------------------------------------
+' INSTITUTION AUS E-MAIL-DOMAIN ABLEITEN
+' Erkennt bekannte Behoerden/Institutionen; sonst Domain-Basis capitaliziert
+' ---------------------------------------------------------------------------
+Public Function ExtrahiereInstitution(ByVal strEmail As String) As String
+    On Error Resume Next
+
+    Dim strDomain As String
+    strDomain = ExtrahiereDomain(strEmail)
+    If strDomain = "" Then ExtrahiereInstitution = "": Exit Function
+
+    ' TLD entfernen (.de, .com, .org etc.)
+    Dim tlds As Variant, tld As Variant
+    tlds = Array(".de", ".org", ".com", ".net", ".eu", ".gov", ".bund")
+    For Each tld In tlds
+        If Right(strDomain, Len(tld)) = CStr(tld) Then
+            strDomain = Left(strDomain, Len(strDomain) - Len(CStr(tld)))
+            Exit For
+        End If
+    Next tld
+
+    ' Bekannte Institutionen mappen
+    Select Case True
+        Case InStr(strDomain, "rp-karlsruhe") > 0:  ExtrahiereInstitution = "RPK": Exit Function
+        Case InStr(strDomain, "rp-freiburg") > 0:   ExtrahiereInstitution = "RPF": Exit Function
+        Case InStr(strDomain, "rp-stuttgart") > 0:   ExtrahiereInstitution = "RPS": Exit Function
+        Case InStr(strDomain, "rps") > 0:            ExtrahiereInstitution = "RPS": Exit Function
+        Case InStr(strDomain, "lubw") > 0:           ExtrahiereInstitution = "LUBW": Exit Function
+        Case InStr(strDomain, "lgl") > 0:            ExtrahiereInstitution = "LGL": Exit Function
+        Case InStr(strDomain, "rpt") > 0:            ExtrahiereInstitution = "RPT": Exit Function
+    End Select
+
+    ' Fallback: erster Teil der Domain capitaliziert
+    Dim strBase As String
+    If InStr(strDomain, ".") > 0 Then
+        strBase = Split(strDomain, ".")(0)
+    Else
+        strBase = strDomain
+    End If
+
+    ExtrahiereInstitution = CapitalizeWord(strBase)
+End Function
+
+
+' ---------------------------------------------------------------------------
+' NAMEN-EINGABE BEREINIGEN (Sonderzeichen, Doppel-Leerzeichen, Trim)
+' ---------------------------------------------------------------------------
+Public Function BereinigeNameInput(ByVal strName As String) As String
+    strName = Replace(strName, "|", "")
+    strName = Replace(strName, ":", "")
+    strName = Replace(strName, "/", "")
+    strName = Replace(strName, ";", "")
+    strName = Replace(strName, Chr(34), "")    ' Anfuehrungszeichen
+    strName = Replace(strName, Chr(160), "")   ' Nicht-druckbares Leerzeichen
+    strName = Replace(strName, "  ", " ")
+    BereinigeNameInput = Trim(strName)
+End Function
+
+
+' ---------------------------------------------------------------------------
+' SORTIERNAME BILDEN ("Nachname, Vorname")
+' ---------------------------------------------------------------------------
+Public Function BildeSortiername(ByVal strNachname As String, ByVal strVorname As String) As String
+    Dim s As String
+    s = Trim(strNachname)
+    If Len(Trim(strVorname)) > 0 Then s = s & ", " & Trim(strVorname)
+    BildeSortiername = s
+End Function
