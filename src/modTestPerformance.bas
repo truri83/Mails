@@ -334,16 +334,16 @@ Private Sub TestNetzwerkBaseline()
                 " (" & FormatProRec(lngLatenz, 10) & " pro Durchgang)"
 
     ' ---- Test 2: Schreib-Durchsatz (1 MB) ----
-    Debug.Print "  Schreib-Test (1 MB sequentiell)..."
+    Debug.Print "  Schreib-Test (1 MB in 64KB-Bloecken)..."
     strTestFile = m_strNetzwerkPfad & "perftest_write.tmp"
 
     Dim strBlock As String
-    strBlock = String(1024, "X")  ' 1 KB Textblock
+    strBlock = String(65536, "X")  ' 64 KB Textblock
 
     t1 = GetTickCount()
     ff = FreeFile
     Open strTestFile For Output As #ff
-    For i = 1 To 1024  ' 1024 x 1KB = 1MB
+    For i = 1 To 16  ' 16 x 64KB = 1MB
         Print #ff, strBlock
     Next i
     Close #ff
@@ -640,14 +640,18 @@ Private Function RunBatchWriteTest_Linked(ByVal lngAnzahl As Long, _
 
     ' Faktor: Vergleich pro-Record-Zeit vs Baseline
     Dim strFaktor As String
-    If m_lngBaselineLinked > 0 And lngZeit > 0 And lngAnzahl > 0 Then
+    If Not blnTransaction Then
+        strFaktor = "Baseline"
+    ElseIf lngZeit = 0 Then
+        strFaktor = "(< 16ms)"
+    ElseIf m_lngBaselineLinked > 0 And lngAnzahl > 0 Then
         Dim dblBaselineProRec As Double
         dblBaselineProRec = CDbl(m_lngBaselineLinked) / CDbl(m_lngAnzahlRecords)
         Dim dblTestProRec As Double
         dblTestProRec = CDbl(lngZeit) / CDbl(lngAnzahl)
         strFaktor = Format(dblBaselineProRec / dblTestProRec, "0.0") & "x"
     Else
-        strFaktor = "Baseline"
+        strFaktor = "n/a"
     End If
 
     Debug.Print PadR(strLabel, 16) & _
@@ -741,9 +745,9 @@ Private Sub TestSchreibMethoden_Linked()
             "'Execute Test " & n & "', " & _
             "'User " & n & "', " & _
             "'user" & n & "@test.de', " & _
-            "#" & Format(Now, "mm/dd/yyyy hh:nn:ss") & "#, " & _
+            "#" & Format(Now, "mm\/dd\/yyyy hh\:nn\:ss") & "#, " & _
             "50000, " & _
-            "#" & Format(Now, "mm/dd/yyyy hh:nn:ss") & "#)", dbFailOnError
+            "#" & Format(Now, "mm\/dd\/yyyy hh\:nn\:ss") & "#)", dbFailOnError
     Next n
     ws.CommitTrans: blnTO = False
     t2 = GetTickCount()
@@ -921,14 +925,18 @@ Private Function RunBatchWriteTest_Direct(ByVal lngAnzahl As Long, _
 
     ' Faktor: pro-Record-Zeit vs Baseline
     Dim strFaktor As String
-    If m_lngBaselineDirect > 0 And lngZeit > 0 And lngAnzahl > 0 Then
+    If Not blnTransaction Then
+        strFaktor = "Baseline"
+    ElseIf lngZeit = 0 Then
+        strFaktor = "(< 16ms)"
+    ElseIf m_lngBaselineDirect > 0 And lngAnzahl > 0 Then
         Dim dblBPR As Double
         dblBPR = CDbl(m_lngBaselineDirect) / CDbl(m_lngAnzahlRecords)
         Dim dblTPR As Double
         dblTPR = CDbl(lngZeit) / CDbl(lngAnzahl)
         strFaktor = Format(dblBPR / dblTPR, "0.0") & "x"
     Else
-        strFaktor = "Baseline"
+        strFaktor = "n/a"
     End If
 
     Debug.Print PadR(strLabel, 16) & _
@@ -1105,7 +1113,7 @@ Private Sub TestHashLookup()
                 PadR("Zeit", 12) & PadR("Pro Lookup", 12) & "Treffer"
     Debug.Print String(74, "-")
 
-    ' --- Test A: DCount einzeln (25 Lookups) ---
+    ' --- Test A: DCount einzeln (25 Lookups, via Direct DAO) ---
     Dim lngFound As Long
     t1 = GetTickCount()
     lngFound = 0
@@ -1117,19 +1125,19 @@ Private Sub TestHashLookup()
         Else
             strH = GeneriereTestHash(n + 5000)     ' existiert NICHT
         End If
-        If DCount("*", "tblTestEmails", "Hash='" & strH & "'") > 0 Then
-            lngFound = lngFound + 1
+        Set rs = dbDirect.OpenRecordset( _
+            "SELECT Count(*) FROM tblTestEmails WHERE Hash='" & strH & "'", dbOpenSnapshot)
+        If Not rs.EOF Then
+            If Nz(rs(0), 0) > 0 Then lngFound = lngFound + 1
         End If
+        rs.Close: Set rs = Nothing
     Next n
     t2 = GetTickCount()
 
-    Debug.Print PadR("DCount (einzeln)", 30) & PadR("1", 8) & _
+    Debug.Print PadR("Count(*) einzeln (Direct)", 30) & PadR("1", 8) & _
                 PadR(FormatMS(t2 - t1), 12) & _
                 PadR(FormatProRec(t2 - t1, 25), 12) & _
                 lngFound & "/25"
-
-    ' HINWEIS: DCount/DLookup geht ueber Linked Table!
-    ' Fuer Direct DAO testen wir SQL-Queries
 
     ' --- Test B: SELECT WHERE Hash = '...' einzeln (Direct DAO) ---
     t1 = GetTickCount()
