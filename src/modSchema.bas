@@ -60,10 +60,7 @@ Public Sub LoescheAlleTabellen()
     Set db = CurrentDb
 
     ' Reihenfolge beachten (abhaengige Tabellen zuerst)
-    tblNames = Array("tblSyncProfilOrdner", "tblSyncProfil", _
-                     "tblEmailStatus", "tblEmailAnhaenge", "tblEmailEmpfaenger", _
-                     "tblEmailContent", "tblEmails", "tblEmailThreads", _
-                     "tblOutlookOrdner", "tblKontakte", "tblSyncLauf", "tblConfig")
+    tblNames = Array("tblSyncProfilOrdner", "tblSyncProfil", "tblEmailStatus", "tblEmailAnhaenge", "tblEmailEmpfaenger", "tblEmailContent", "tblEmails", "tblEmailThreads", "tblOutlookOrdner", "tblKontakte", "tblSyncLauf", "tblConfig")
 
     Debug.Print String(70, "=")
     Debug.Print "=== LOESCHE alle Tabellen ==="
@@ -100,13 +97,13 @@ Private Sub Erstelle_tblConfig()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblConfig (" & _
-        "  ConfigID AUTOINCREMENT CONSTRAINT PK_Config PRIMARY KEY," & _
-        "  Schluessel TEXT(100) NOT NULL," & _
-        "  Wert TEXT(255)," & _
-        "  Beschreibung TEXT(255)" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblConfig ("
+    sql = sql & "ConfigID AUTOINCREMENT CONSTRAINT PK_Config PRIMARY KEY, "
+    sql = sql & "Schluessel TEXT(100) NOT NULL, "
+    sql = sql & "Wert TEXT(255), "
+    sql = sql & "Beschreibung TEXT(255))"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE UNIQUE INDEX idx_Config_Key ON tblConfig (Schluessel)"
     Debug.Print "  [OK  ] tblConfig"
@@ -118,20 +115,20 @@ Private Sub Erstelle_tblSyncLauf()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblSyncLauf (" & _
-        "  SyncLaufID AUTOINCREMENT CONSTRAINT PK_SyncLauf PRIMARY KEY," & _
-        "  StartZeit DATETIME," & _
-        "  EndeZeit DATETIME," & _
-        "  Status TEXT(20) DEFAULT 'Gestartet'," & _
-        "  AnzahlGelesen LONG DEFAULT 0," & _
-        "  AnzahlNeu LONG DEFAULT 0," & _
-        "  AnzahlDuplikate LONG DEFAULT 0," & _
-        "  AnzahlFehler LONG DEFAULT 0," & _
-        "  OrdnerPfad TEXT(255)," & _
-        "  Projekt TEXT(100)," & _
-        "  Phase TEXT(100)" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblSyncLauf ("
+    sql = sql & "SyncLaufID AUTOINCREMENT CONSTRAINT PK_SyncLauf PRIMARY KEY, "
+    sql = sql & "StartZeit DATETIME, "
+    sql = sql & "EndeZeit DATETIME, "
+    sql = sql & "Status TEXT(20) DEFAULT 'Gestartet', "
+    sql = sql & "AnzahlGelesen LONG DEFAULT 0, "
+    sql = sql & "AnzahlNeu LONG DEFAULT 0, "
+    sql = sql & "AnzahlDuplikate LONG DEFAULT 0, "
+    sql = sql & "AnzahlFehler LONG DEFAULT 0, "
+    sql = sql & "OrdnerPfad TEXT(255), "
+    sql = sql & "Projekt TEXT(100), "
+    sql = sql & "Phase TEXT(100))"
+    CurrentDb.Execute sql
 
     Debug.Print "  [OK  ] tblSyncLauf"
 End Sub
@@ -142,22 +139,22 @@ Private Sub Erstelle_tblKontakte()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblKontakte (" & _
-        "  KontaktID AUTOINCREMENT CONSTRAINT PK_Kontakte PRIMARY KEY," & _
-        "  Anzeigename TEXT(255)," & _
-        "  Email TEXT(255)," & _
-        "  EmailTyp TEXT(10)," & _
-        "  Vorname TEXT(100)," & _
-        "  Nachname TEXT(100)," & _
-        "  Titel TEXT(50)," & _
-        "  Namenszusatz TEXT(100)," & _
-        "  Institution TEXT(255)," & _
-        "  Sortiername TEXT(255)," & _
-        "  KontaktTyp TEXT(20)," & _
-        "  ErstelltAm DATETIME," & _
-        "  AktualisiertAm DATETIME" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblKontakte ("
+    sql = sql & "KontaktID AUTOINCREMENT CONSTRAINT PK_Kontakte PRIMARY KEY, "
+    sql = sql & "Anzeigename TEXT(255), "
+    sql = sql & "Email TEXT(255), "
+    sql = sql & "EmailTyp TEXT(10), "
+    sql = sql & "Vorname TEXT(100), "
+    sql = sql & "Nachname TEXT(100), "
+    sql = sql & "Titel TEXT(50), "
+    sql = sql & "Namenszusatz TEXT(100), "
+    sql = sql & "Institution TEXT(255), "
+    sql = sql & "Sortiername TEXT(255), "
+    sql = sql & "KontaktTyp TEXT(20), "
+    sql = sql & "ErstelltAm DATETIME, "
+    sql = sql & "AktualisiertAm DATETIME)"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE INDEX idx_Kontakte_Email ON tblKontakte (Email)"
     Debug.Print "  [OK  ] tblKontakte"
@@ -169,17 +166,17 @@ Private Sub Erstelle_tblOutlookOrdner()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblOutlookOrdner (" & _
-        "  OrdnerID AUTOINCREMENT CONSTRAINT PK_Ordner PRIMARY KEY," & _
-        "  OrdnerName TEXT(255)," & _
-        "  OrdnerPfad TEXT(255)," & _
-        "  ParentID LONG DEFAULT 0," & _
-        "  PostfachName TEXT(255)," & _
-        "  StoreID TEXT(255)," & _
-        "  ElementAnzahl LONG DEFAULT 0," & _
-        "  LetzterSync DATETIME" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblOutlookOrdner ("
+    sql = sql & "OrdnerID AUTOINCREMENT CONSTRAINT PK_Ordner PRIMARY KEY, "
+    sql = sql & "OrdnerName TEXT(255), "
+    sql = sql & "OrdnerPfad TEXT(255), "
+    sql = sql & "ParentID LONG DEFAULT 0, "
+    sql = sql & "PostfachName TEXT(255), "
+    sql = sql & "StoreID TEXT(255), "
+    sql = sql & "ElementAnzahl LONG DEFAULT 0, "
+    sql = sql & "LetzterSync DATETIME)"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE UNIQUE INDEX idx_Ordner_Pfad ON tblOutlookOrdner (OrdnerPfad)"
     Debug.Print "  [OK  ] tblOutlookOrdner"
@@ -191,17 +188,17 @@ Private Sub Erstelle_tblEmailThreads()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblEmailThreads (" & _
-        "  ThreadID AUTOINCREMENT CONSTRAINT PK_Threads PRIMARY KEY," & _
-        "  ThreadBetreff TEXT(255)," & _
-        "  ThreadIdentifier TEXT(255)," & _
-        "  Antwortanzahl LONG DEFAULT 1," & _
-        "  ErsterAbsender TEXT(255)," & _
-        "  ErstesMailDatum DATETIME," & _
-        "  LetztesMailDatum DATETIME," & _
-        "  ErstelltAm DATETIME" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblEmailThreads ("
+    sql = sql & "ThreadID AUTOINCREMENT CONSTRAINT PK_Threads PRIMARY KEY, "
+    sql = sql & "ThreadBetreff TEXT(255), "
+    sql = sql & "ThreadIdentifier TEXT(255), "
+    sql = sql & "Antwortanzahl LONG DEFAULT 1, "
+    sql = sql & "ErsterAbsender TEXT(255), "
+    sql = sql & "ErstesMailDatum DATETIME, "
+    sql = sql & "LetztesMailDatum DATETIME, "
+    sql = sql & "ErstelltAm DATETIME)"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE UNIQUE INDEX idx_Thread_Ident ON tblEmailThreads (ThreadIdentifier)"
     Debug.Print "  [OK  ] tblEmailThreads"
@@ -213,32 +210,32 @@ Private Sub Erstelle_tblEmails()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblEmails (" & _
-        "  EmailID AUTOINCREMENT CONSTRAINT PK_Emails PRIMARY KEY," & _
-        "  OutlookEntryID TEXT(255)," & _
-        "  UniqueHash TEXT(64)," & _
-        "  ThreadID LONG DEFAULT 0," & _
-        "  OrdnerID LONG DEFAULT 0," & _
-        "  KontaktID_Absender LONG DEFAULT 0," & _
-        "  SyncLaufID LONG DEFAULT 0," & _
-        "  Betreff TEXT(255)," & _
-        "  BetreffBereinigt TEXT(255)," & _
-        "  AbsenderName TEXT(255)," & _
-        "  AbsenderEmail TEXT(255)," & _
-        "  EmpfangenAm DATETIME," & _
-        "  GesendetAm DATETIME," & _
-        "  Groesse LONG DEFAULT 0," & _
-        "  Wichtigkeit SHORT DEFAULT 1," & _
-        "  Gelesen YESNO," & _
-        "  HatAnhaenge YESNO," & _
-        "  AnhangAnzahl SHORT DEFAULT 0," & _
-        "  MessageClass TEXT(50)," & _
-        "  InternetMessageID TEXT(255)," & _
-        "  MSGDateiPfad TEXT(255)," & _
-        "  Status TEXT(20) DEFAULT 'Neu'," & _
-        "  ErstelltAm DATETIME" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblEmails ("
+    sql = sql & "EmailID AUTOINCREMENT CONSTRAINT PK_Emails PRIMARY KEY, "
+    sql = sql & "OutlookEntryID TEXT(255), "
+    sql = sql & "UniqueHash TEXT(64), "
+    sql = sql & "ThreadID LONG DEFAULT 0, "
+    sql = sql & "OrdnerID LONG DEFAULT 0, "
+    sql = sql & "KontaktID_Absender LONG DEFAULT 0, "
+    sql = sql & "SyncLaufID LONG DEFAULT 0, "
+    sql = sql & "Betreff TEXT(255), "
+    sql = sql & "BetreffBereinigt TEXT(255), "
+    sql = sql & "AbsenderName TEXT(255), "
+    sql = sql & "AbsenderEmail TEXT(255), "
+    sql = sql & "EmpfangenAm DATETIME, "
+    sql = sql & "GesendetAm DATETIME, "
+    sql = sql & "Groesse LONG DEFAULT 0, "
+    sql = sql & "Wichtigkeit SHORT DEFAULT 1, "
+    sql = sql & "Gelesen YESNO, "
+    sql = sql & "HatAnhaenge YESNO, "
+    sql = sql & "AnhangAnzahl SHORT DEFAULT 0, "
+    sql = sql & "MessageClass TEXT(50), "
+    sql = sql & "InternetMessageID TEXT(255), "
+    sql = sql & "MSGDateiPfad TEXT(255), "
+    sql = sql & "Status TEXT(20) DEFAULT 'Neu', "
+    sql = sql & "ErstelltAm DATETIME)"
+    CurrentDb.Execute sql
 
     Debug.Print "  [OK  ] tblEmails"
 End Sub
@@ -249,16 +246,16 @@ Private Sub Erstelle_tblEmailContent()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblEmailContent (" & _
-        "  ContentID AUTOINCREMENT CONSTRAINT PK_Content PRIMARY KEY," & _
-        "  EmailID LONG NOT NULL," & _
-        "  HTMLBody MEMO," & _
-        "  PlainTextBody MEMO," & _
-        "  HatHTML YESNO," & _
-        "  GroesseHTML LONG DEFAULT 0," & _
-        "  GroesseText LONG DEFAULT 0" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblEmailContent ("
+    sql = sql & "ContentID AUTOINCREMENT CONSTRAINT PK_Content PRIMARY KEY, "
+    sql = sql & "EmailID LONG NOT NULL, "
+    sql = sql & "HTMLBody MEMO, "
+    sql = sql & "PlainTextBody MEMO, "
+    sql = sql & "HatHTML YESNO, "
+    sql = sql & "GroesseHTML LONG DEFAULT 0, "
+    sql = sql & "GroesseText LONG DEFAULT 0)"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE UNIQUE INDEX idx_Content_EmailID ON tblEmailContent (EmailID)"
     Debug.Print "  [OK  ] tblEmailContent"
@@ -270,15 +267,15 @@ Private Sub Erstelle_tblEmailEmpfaenger()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblEmailEmpfaenger (" & _
-        "  EmpfaengerID AUTOINCREMENT CONSTRAINT PK_Empfaenger PRIMARY KEY," & _
-        "  EmailID LONG NOT NULL," & _
-        "  KontaktID LONG DEFAULT 0," & _
-        "  Typ TEXT(5)," & _
-        "  Anzeigename TEXT(255)," & _
-        "  Email TEXT(255)" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblEmailEmpfaenger ("
+    sql = sql & "EmpfaengerID AUTOINCREMENT CONSTRAINT PK_Empfaenger PRIMARY KEY, "
+    sql = sql & "EmailID LONG NOT NULL, "
+    sql = sql & "KontaktID LONG DEFAULT 0, "
+    sql = sql & "Typ TEXT(5), "
+    sql = sql & "Anzeigename TEXT(255), "
+    sql = sql & "Email TEXT(255))"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE INDEX idx_Empf_EmailID ON tblEmailEmpfaenger (EmailID)"
     Debug.Print "  [OK  ] tblEmailEmpfaenger"
@@ -290,21 +287,21 @@ Private Sub Erstelle_tblEmailAnhaenge()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblEmailAnhaenge (" & _
-        "  AnhangID AUTOINCREMENT CONSTRAINT PK_Anhaenge PRIMARY KEY," & _
-        "  EmailID LONG NOT NULL," & _
-        "  Dateiname TEXT(255)," & _
-        "  DateinameBereinigt TEXT(255)," & _
-        "  Erweiterung TEXT(20)," & _
-        "  Groesse LONG DEFAULT 0," & _
-        "  MimeType TEXT(100)," & _
-        "  AnhangTyp SHORT DEFAULT 1," & _
-        "  IstVersteckt YESNO," & _
-        "  IstGespeichert YESNO," & _
-        "  DateiPfad TEXT(255)," & _
-        "  ErstelltAm DATETIME" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblEmailAnhaenge ("
+    sql = sql & "AnhangID AUTOINCREMENT CONSTRAINT PK_Anhaenge PRIMARY KEY, "
+    sql = sql & "EmailID LONG NOT NULL, "
+    sql = sql & "Dateiname TEXT(255), "
+    sql = sql & "DateinameBereinigt TEXT(255), "
+    sql = sql & "Erweiterung TEXT(20), "
+    sql = sql & "Groesse LONG DEFAULT 0, "
+    sql = sql & "MimeType TEXT(100), "
+    sql = sql & "AnhangTyp SHORT DEFAULT 1, "
+    sql = sql & "IstVersteckt YESNO, "
+    sql = sql & "IstGespeichert YESNO, "
+    sql = sql & "DateiPfad TEXT(255), "
+    sql = sql & "ErstelltAm DATETIME)"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE INDEX idx_Anh_EmailID ON tblEmailAnhaenge (EmailID)"
     Debug.Print "  [OK  ] tblEmailAnhaenge"
@@ -316,15 +313,15 @@ Private Sub Erstelle_tblEmailStatus()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblEmailStatus (" & _
-        "  StatusID AUTOINCREMENT CONSTRAINT PK_EmailStatus PRIMARY KEY," & _
-        "  EmailID LONG NOT NULL," & _
-        "  Status TEXT(50)," & _
-        "  GeaendertVon TEXT(100)," & _
-        "  Bemerkung TEXT(255)," & _
-        "  GeaendertAm DATETIME" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblEmailStatus ("
+    sql = sql & "StatusID AUTOINCREMENT CONSTRAINT PK_EmailStatus PRIMARY KEY, "
+    sql = sql & "EmailID LONG NOT NULL, "
+    sql = sql & "Status TEXT(50), "
+    sql = sql & "GeaendertVon TEXT(100), "
+    sql = sql & "Bemerkung TEXT(255), "
+    sql = sql & "GeaendertAm DATETIME)"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE INDEX idx_Status_EmailID ON tblEmailStatus (EmailID)"
     Debug.Print "  [OK  ] tblEmailStatus"
@@ -340,19 +337,19 @@ Private Sub Erstelle_tblSyncProfil()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblSyncProfil (" & _
-        "  ProfilID AUTOINCREMENT CONSTRAINT PK_SyncProfil PRIMARY KEY," & _
-        "  ProfilName TEXT(100) NOT NULL," & _
-        "  Beschreibung TEXT(255)," & _
-        "  IstAktiv YESNO," & _
-        "  Projekt TEXT(100)," & _
-        "  Phase TEXT(100)," & _
-        "  MaxMailsProOrdner LONG DEFAULT 500," & _
-        "  MaxTiefe SHORT DEFAULT 5," & _
-        "  ExportPfad TEXT(255)," & _
-        "  ErstelltAm DATETIME" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblSyncProfil ("
+    sql = sql & "ProfilID AUTOINCREMENT CONSTRAINT PK_SyncProfil PRIMARY KEY, "
+    sql = sql & "ProfilName TEXT(100) NOT NULL, "
+    sql = sql & "Beschreibung TEXT(255), "
+    sql = sql & "IstAktiv YESNO, "
+    sql = sql & "Projekt TEXT(100), "
+    sql = sql & "Phase TEXT(100), "
+    sql = sql & "MaxMailsProOrdner LONG DEFAULT 500, "
+    sql = sql & "MaxTiefe SHORT DEFAULT 5, "
+    sql = sql & "ExportPfad TEXT(255), "
+    sql = sql & "ErstelltAm DATETIME)"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE UNIQUE INDEX idx_Profil_Name ON tblSyncProfil (ProfilName)"
     Debug.Print "  [OK  ] tblSyncProfil"
@@ -368,14 +365,14 @@ Private Sub Erstelle_tblSyncProfilOrdner()
         Exit Sub
     End If
 
-    CurrentDb.Execute _
-        "CREATE TABLE tblSyncProfilOrdner (" & _
-        "  ID AUTOINCREMENT CONSTRAINT PK_SyncProfilOrdner PRIMARY KEY," & _
-        "  ProfilID LONG NOT NULL," & _
-        "  OrdnerPfad TEXT(255) NOT NULL," & _
-        "  PostfachName TEXT(255)," & _
-        "  IstAktiv YESNO" & _
-        ")"
+    Dim sql As String
+    sql = "CREATE TABLE tblSyncProfilOrdner ("
+    sql = sql & "ID AUTOINCREMENT CONSTRAINT PK_SyncProfilOrdner PRIMARY KEY, "
+    sql = sql & "ProfilID LONG NOT NULL, "
+    sql = sql & "OrdnerPfad TEXT(255) NOT NULL, "
+    sql = sql & "PostfachName TEXT(255), "
+    sql = sql & "IstAktiv YESNO)"
+    CurrentDb.Execute sql
 
     CurrentDb.Execute "CREATE INDEX idx_ProfilOrdner_Profil ON tblSyncProfilOrdner (ProfilID)"
     Debug.Print "  [OK  ] tblSyncProfilOrdner"
@@ -414,30 +411,18 @@ Public Sub InitStandardConfig()
     Set db = CurrentDb
 
     On Error Resume Next
-    Call SetzeConfig(db, "ExportBasisPfad", Environ("USERPROFILE") & "\OutlookSync\", _
-                    "Basis-Pfad fuer MSG- und Anhang-Export")
-    Call SetzeConfig(db, "MaxMailsProSync", "500", _
-                    "Maximale Anzahl Mails pro Sync-Durchlauf")
-    Call SetzeConfig(db, "AnhaengeExtrahieren", "1", _
-                    "Anhaenge auf Festplatte extrahieren (1=Ja / 0=Nein)")
-    Call SetzeConfig(db, "MSGExportieren", "1", _
-                    "MSG-Dateien exportieren (1=Ja / 0=Nein)")
-    Call SetzeConfig(db, "SignaturBilderFiltern", "1", _
-                    "Versteckte Signatur-Bilder ueberspringen (1=Ja / 0=Nein)")
-    Call SetzeConfig(db, "LogLevel", "3", _
-                    "Log-Level (0=Aus 1=Error 2=Warn 3=Info 4=Debug 5=Trace)")
-    Call SetzeConfig(db, "SchemaVersion", SCHEMA_VERSION, _
-                    "Aktuelle Schema-Version")
-    Call SetzeConfig(db, "BackendPfad", "", _
-                    "Pfad zur Backend-Datenbank (leer = lokal)")
-    Call SetzeConfig(db, "TempPfad", "", _
-                    "Temp-Verzeichnis fuer Extraktion (leer = %TEMP%\OutlookSync\)")
-    Call SetzeConfig(db, "BufferGroesse", "25", _
-                    "Anzahl Mails im Schreib-Puffer vor Flush (5-500)")
-    Call SetzeConfig(db, "NetzwerkRetries", "3", _
-                    "Anzahl Wiederholungsversuche bei Netzwerkfehlern")
-    Call SetzeConfig(db, "NetzwerkRetryPause", "2000", _
-                    "Millisekunden Pause zwischen Netzwerk-Retries")
+    Call SetzeConfig(db, "ExportBasisPfad", Environ("USERPROFILE") & "\OutlookSync\", "Basis-Pfad fuer MSG- und Anhang-Export")
+    Call SetzeConfig(db, "MaxMailsProSync", "500", "Maximale Anzahl Mails pro Sync-Durchlauf")
+    Call SetzeConfig(db, "AnhaengeExtrahieren", "1", "Anhaenge auf Festplatte extrahieren (1=Ja / 0=Nein)")
+    Call SetzeConfig(db, "MSGExportieren", "1", "MSG-Dateien exportieren (1=Ja / 0=Nein)")
+    Call SetzeConfig(db, "SignaturBilderFiltern", "1", "Versteckte Signatur-Bilder ueberspringen (1=Ja / 0=Nein)")
+    Call SetzeConfig(db, "LogLevel", "3", "Log-Level (0=Aus 1=Error 2=Warn 3=Info 4=Debug 5=Trace)")
+    Call SetzeConfig(db, "SchemaVersion", SCHEMA_VERSION, "Aktuelle Schema-Version")
+    Call SetzeConfig(db, "BackendPfad", "", "Pfad zur Backend-Datenbank (leer = lokal)")
+    Call SetzeConfig(db, "TempPfad", "", "Temp-Verzeichnis fuer Extraktion (leer = %TEMP%\OutlookSync\)")
+    Call SetzeConfig(db, "BufferGroesse", "25", "Anzahl Mails im Schreib-Puffer vor Flush (5-500)")
+    Call SetzeConfig(db, "NetzwerkRetries", "3", "Anzahl Wiederholungsversuche bei Netzwerkfehlern")
+    Call SetzeConfig(db, "NetzwerkRetryPause", "2000", "Millisekunden Pause zwischen Netzwerk-Retries")
     On Error GoTo 0
 
     Debug.Print "  [OK  ] Standardkonfiguration gesetzt"
@@ -449,8 +434,7 @@ Private Sub SetzeConfig(db As DAO.Database, strKey As String, strVal As String, 
     Dim lngCount As Long
     lngCount = DCount("*", "tblConfig", "Schluessel='" & strKey & "'")
     If lngCount = 0 Then
-        db.Execute "INSERT INTO tblConfig (Schluessel, Wert, Beschreibung) VALUES ('" & _
-                   strKey & "', '" & Replace(strVal, "'", "''") & "', '" & Replace(strDesc, "'", "''") & "')"
+        db.Execute "INSERT INTO tblConfig (Schluessel, Wert, Beschreibung) VALUES ('" & strKey & "', '" & Replace(strVal, "'", "''") & "', '" & Replace(strDesc, "'", "''") & "')"
     End If
     On Error GoTo 0
 End Sub
@@ -488,7 +472,6 @@ End Function
 ' Konfigurationswert schreiben
 Public Sub SchreibeConfig(ByVal strKey As String, ByVal strVal As String)
     On Error Resume Next
-    CurrentDb.Execute "UPDATE tblConfig SET Wert='" & Replace(strVal, "'", "''") & _
-                      "' WHERE Schluessel='" & strKey & "'"
+    CurrentDb.Execute "UPDATE tblConfig SET Wert='" & Replace(strVal, "'", "''") & "' WHERE Schluessel='" & strKey & "'"
     On Error GoTo 0
 End Sub
