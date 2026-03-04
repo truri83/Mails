@@ -1,4 +1,4 @@
-# OutlookSync – Konzept & Architektur (v0.3)
+# OutlookSync – Konzept & Architektur (v0.5)
 
 ## 1. Projektziel
 
@@ -233,28 +233,33 @@ Ohne Backend-Konfiguration arbeitet alles lokal (abwärtskompatibel).
 
 ---
 
-## 6. Modulstruktur (12 Module)
+## 6. Modulstruktur (17 Module)
 
-| Modul | Zeilen* | Aufgabe |
-|---|---|---|
-| **modMailExtract** | ~350 | **NEU v0.3**: Datentypen (TypMailKomplett etc.), COM-Extraktion, Temp-Dateien, Header-Parser |
-| **modBackend** | ~330 | **NEU v0.3**: FE/BE-Verknüpfung, Reconnect, Backend-DB-Erstellung, Datenmigration |
-| **modAsyncBuffer** | ~400 | **NEU v0.3**: Schreib-Puffer, Batch-Flush, Datei-Queue, Retry-Logik |
-| **modSchema** | ~500 | Tabellen-DDL, Indizes, Konfiguration (+tblSyncProfil, +tblSyncProfilOrdner) |
-| **modGlobals** | ~130 | Konstanten, MAPI-Tags, globale Objekte, Init/Cleanup |
-| **modCrypto** | ~160 | SHA256-Hash via Windows CryptoAPI |
-| **modLogging** | ~110 | SchreibeLog, LogInfo/Warn/Error/Debug, Logfile |
-| **modStringUtils** | ~400 | Betreff, Dateinamen, Pfade, E-Mail, Capitalize, Institution |
-| **modKontakte** | ~440 | Namens-Parsing, Geschlecht, Anrede, Domain-Lernen |
-| **modOutlookConnect** | ~300 | Outlook/RDO Connect, SMTP-Auflösung, Ordner öffnen |
-| **modDAO** | ~580 | Datenzugriff: Kontakte, Emails, Threads, Ordner, Anhänge |
-| **modSync** | ~530 | Sync-Orchestrierung, Profil-Sync, Subfolder, Postfach |
+| Modul | Aufgabe |
+|---|---|
+| **modDDL** | **NEU v0.5**: Zentrales DDL-Basismodul, Backend-transparent, idempotent |
+| **modSchema** | Tabellenschema (12 Tabellen + Indizes + Config), nutzt modDDL |
+| **modTransactionManager** | **NEU v0.4**: Transaktions-Steuerung, Doom-Flag, ForceCleanup, TLookup/TCount |
+| **modFileManager** | **NEU v0.4**: Dateiablage-Struktur, Netzwerk-Prüfung, Retry-Logik, Pfadbau |
+| **modOrdner** | **NEU v0.4**: Outlook-Ordner-Scan (alle Stores), tblOutlookOrdner-Sync |
+| **modCID** | **NEU v0.4**: CID-Inline-Bilder aus HTML extrahieren und durch Dateipfade ersetzen |
+| **modMailExtract** | Datentypen (TypMailKomplett etc.), COM-Extraktion, Temp-Dateien, Header-Parser |
+| **modBackend** | FE/BE-Verknüpfung, Reconnect, Backend-DB-Erstellung, Datenmigration |
+| **modAsyncBuffer** | Schreib-Puffer, Batch-Flush, Datei-Queue, Retry-Logik |
+| **modGlobals** | Konstanten, MAPI-Tags, globale Objekte, Init/Cleanup |
+| **modCrypto** | SHA256-Hash via Windows CryptoAPI |
+| **modLogging** | SchreibeLog, LogInfo/Warn/Error/Debug, Logfile |
+| **modStringUtils** | Betreff, Dateinamen, Pfade, E-Mail, Capitalize, Institution |
+| **modKontakte** | Namens-Parsing, Geschlecht, Anrede, Domain-Lernen |
+| **modOutlookConnect** | Outlook/RDO Connect, SMTP-Auflösung, Ordner öffnen |
+| **modDAO** | Datenzugriff: Kontakte, Emails, Threads, Ordner, Anhänge |
+| **modSync** | Sync-Orchestrierung, Profil-Sync, Subfolder, Postfach |
 
-\* Ungefähre Zeilenanzahl. Zusätzlich: `modOutlookTest.bas` (Standalone-Testmodul)
+Testmodule in `test_helper/`: `modOutlookTest.bas`, `modTestKopiermethoden.bas`, `modTestPerformance.bas`
 
 ---
 
-## 7. Datenfluss (v0.3)
+## 7. Datenfluss (v0.5)
 
 ```
 Outlook-Ordner
@@ -315,6 +320,7 @@ modSync.SyncFolder(objFolder, "Projekt", "Phase", 500)
 modSync (Orchestrierung)
   ├── modMailExtract  (Types + Extraktion)
   ├── modAsyncBuffer  (Puffer + Flush + DateiQueue)
+  │     ├── modTransactionManager (Transaktionen)
   │     ├── modDAO
   │     │     ├── modCrypto
   │     │     ├── modStringUtils
@@ -331,21 +337,42 @@ modMailExtract (Extraktion)
   ├── modOutlookConnect (SMTP-Auflösung)
   ├── modCrypto         (Hash-Generierung)
   ├── modStringUtils    (Pfade, Bereinigung)
+  ├── modCID            (CID-Inline-Bilder)
   └── modGlobals        (Konstanten, MAPI-Tags)
 
 modBackend (FE/BE-Verwaltung)
-  ├── modSchema (TabelleExistiert, ErstelleAlleTabellen)
-  ├── modStringUtils (NormalisierePfad, ErstelleOrdner)
+  ├── modSchema  (Tabellenkonstanten, ErstelleAlleTabellen)
+  ├── modDDL     (DDL_TabelleExistiert, DDL_IstVerknuepft)
+  ├── modStringUtils (ErstelleOrdner)
+  └── modLogging
+
+modSchema (Tabellenschema)
+  ├── modDDL     (alle DDL-Operationen)
+  └── modLogging
+
+modFileManager (Dateiablage)
+  ├── modStringUtils
+  └── modLogging
+
+modOrdner (Ordner-Scan)
+  ├── modOutlookConnect
+  ├── modDAO
+  ├── modGlobals
+  └── modLogging
+
+modCID (Inline-Bilder)
+  ├── modStringUtils
   └── modLogging
 
 modKontakte
   ├── modStringUtils
   └── modLogging
 
-modSchema (standalone)
-modGlobals (standalone)
-modCrypto (standalone - nur advapi32.dll)
-modLogging (standalone - nur Debug.Print + Dateisystem)
+modTransactionManager (standalone - nur DAO + modLogging)
+modDDL       (standalone - nur modLogging)
+modGlobals   (standalone)
+modCrypto    (standalone - nur advapi32.dll)
+modLogging   (standalone - nur Debug.Print + Dateisystem)
 ```
 
 ---
@@ -396,18 +423,23 @@ modLogging (standalone - nur Debug.Print + Dateisystem)
 
 ```
 1. Alle .bas-Dateien in Access importieren (ALT+F11 → Datei → Importieren):
-   - modSchema.bas         (Tabellen-DDL)
-   - modGlobals.bas        (Konstanten)
-   - modCrypto.bas         (SHA256)
-   - modLogging.bas        (Logging)
-   - modStringUtils.bas    (String-Helfer)
-   - modKontakte.bas       (Kontaktlogik)
-   - modOutlookConnect.bas (Outlook/Redemption)
-   - modMailExtract.bas    (NEU: Extraktion + Types)
-   - modBackend.bas        (NEU: FE/BE-Verwaltung)
-   - modAsyncBuffer.bas    (NEU: Schreib-Puffer)
-   - modDAO.bas            (Datenzugriff)
-   - modSync.bas           (Sync-Orchestrierung)
+   - modDDL.bas              (DDL-Basis, zuerst importieren)
+   - modSchema.bas           (Tabellen-DDL)
+   - modGlobals.bas          (Konstanten)
+   - modCrypto.bas           (SHA256)
+   - modLogging.bas          (Logging)
+   - modStringUtils.bas      (String-Helfer)
+   - modKontakte.bas         (Kontaktlogik)
+   - modOutlookConnect.bas   (Outlook/Redemption)
+   - modMailExtract.bas      (Extraktion + Types)
+   - modBackend.bas          (FE/BE-Verwaltung)
+   - modTransactionManager.bas (Transaktions-Steuerung)
+   - modFileManager.bas      (Dateiablage + Netzwerk)
+   - modOrdner.bas           (Ordner-Scan)
+   - modCID.bas              (CID-Inline-Bilder)
+   - modAsyncBuffer.bas      (Schreib-Puffer)
+   - modDAO.bas              (Datenzugriff)
+   - modSync.bas             (Sync-Orchestrierung)
 
 2. Tabellen erstellen (Direktbereich STRG+G):
    ErstelleAlleTabellen
@@ -420,9 +452,11 @@ modLogging (standalone - nur Debug.Print + Dateisystem)
 4. Erster Sync:
    SyncPosteingang "MeinProjekt", "Phase1"
 
-WICHTIG bei Upgrade von v0.2:
-   LoescheAlleTabellen    ' Schema hat sich geändert (+StoreID, +Profile)
-   ErstelleAlleTabellen   ' Neu erstellen
+WICHTIG bei Upgrade von einer älteren Version:
+   SchemaAktualisieren       ' Fehlende Spalten + Indizes nachziehen (kein Datenverlust)
+   ' oder bei inkompatiblem Schema:
+   LoescheAlleTabellen       ' ACHTUNG: Löscht alle Daten!
+   ErstelleAlleTabellen      ' Neu erstellen
 ```
 
 ---
@@ -432,6 +466,7 @@ WICHTIG bei Upgrade von v0.2:
 ```vba
 ' === Schema ===
 ErstelleAlleTabellen              ' Alle Tabellen erstellen (einmalig)
+SchemaAktualisieren               ' Fehlende Spalten/Indizes nachziehen
 LoescheAlleTabellen               ' ACHTUNG: Löscht alle Daten!
 
 ' === Backend ===
@@ -439,6 +474,10 @@ VerknuepfeBackend "\\Server\Share\OutlookSync_BE.accdb"
 TrenneBackend
 ? BackendStatus()
 ? IstBackendVerfuegbar()
+
+' === Ordner-Scan ===
+ScanneAlleOrdner                             ' Alle Outlook-Stores einlesen
+SyncOrdnerStruktur 3                         ' Ordner bis Tiefe 3 (alt)
 
 ' === Einfacher Sync ===
 SyncPosteingang                              ' Posteingang (Standard)
@@ -455,9 +494,6 @@ id = ErstelleSyncProfil("FLIWAS_Prod", "FLIWAS", "Produktion")
 ProfilOrdnerHinzufuegen id, "Torsten.Kugler@rps.bwl.de\Posteingang\FLIWAS"
 ProfilOrdnerHinzufuegen id, "Torsten.Kugler@rps.bwl.de\Gesendete Elemente"
 SyncMitProfil "FLIWAS_Prod"
-
-' === Ordnerstruktur ===
-SyncOrdnerStruktur 3              ' Alle Ordner bis Tiefe 3 einlesen
 
 ' === Konfiguration ===
 ? LeseConfig("ExportBasisPfad")
@@ -500,9 +536,10 @@ End Type
 |---|---|---|
 | **v0.1** | Schema + Grundmodule (8 .bas) | ✅ |
 | **v0.2** | Kontakt-Erweiterung, Namens-Parsing, Subfolder-Sync | ✅ |
-| **v0.3** | **FE/BE-Architektur, Extract-Buffer-Flush, Datei-Queue, Profil-Sync** | ← AKTUELL |
-| v0.4 | CID/Inline-Bild-Auflösung, HTML-Content-Bereinigung | |
-| v0.5 | StatusPanel (Fortschrittsanzeige via Access-Formular) | |
+| **v0.3** | FE/BE-Architektur, Extract-Buffer-Flush, Datei-Queue, Profil-Sync | ✅ |
+| **v0.4** | modCID (CID/Inline-Bilder), modOrdner (Ordner-Scan), modFileManager, modTransactionManager | ✅ |
+| **v0.5** | **modDDL** (Backend-transparentes DDL-Basismodul), SchemaAktualisieren(), Feld-Defaults via DAO | ← AKTUELL |
 | v0.6 | Inkrementeller Sync (nur neue Mails seit LetzterSync) | |
-| v0.7 | Formular: Sync-Steuerung + Ordnerauswahl + Profilmanager | |
+| v0.7 | StatusPanel (Fortschrittsanzeige via Access-Formular) | |
+| v0.8 | Formular: Sync-Steuerung + Ordnerauswahl + Profilmanager | |
 | v1.0 | Produktionsreif | |

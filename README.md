@@ -5,17 +5,26 @@
 ## Projektstruktur
 
 ```
-├── KONZEPT.md              Architektur, Tabellenschema, Datenfluss
-├── modOutlookTest.bas      Standalone-Testmodul (Outlook-Zugriff testen)
+├── KONZEPT.md                  Architektur, Tabellenschema, Datenfluss
 └── src/
-    ├── modSchema.bas       Tabellen-DDL (10 Tabellen + Indizes + Config)
-    ├── modGlobals.bas      Konstanten, MAPI-Tags, globale Objekte, Init
-    ├── modCrypto.bas       SHA256-Hash (Windows CryptoAPI)
-    ├── modLogging.bas      Logging (Debug.Print + Logfile)
-    ├── modStringUtils.bas  String-Bereinigung, Pfade, E-Mail-Validierung
-    ├── modOutlookConnect.bas  Outlook/Redemption Connect, SMTP-Auflösung
-    ├── modDAO.bas          Datenzugriffsschicht (alle Tabellen)
-    └── modSync.bas         Sync-Orchestrierung (Hauptlogik)
+    ├── modDDL.bas              DDL-Basismodul (Backend-transparent, idempotent)
+    ├── modSchema.bas           Tabellenschema (12 Tabellen + Indizes + Config)
+    ├── modGlobals.bas          Konstanten, MAPI-Tags, globale Objekte, Init
+    ├── modCrypto.bas           SHA256-Hash (Windows CryptoAPI)
+    ├── modLogging.bas          Logging (Debug.Print + Logfile)
+    ├── modStringUtils.bas      String-Bereinigung, Pfade, E-Mail-Validierung
+    ├── modOutlookConnect.bas   Outlook/Redemption Connect, SMTP-Auflösung
+    ├── modKontakte.bas         Kontakt-Parsing, Namens-Analyse, Domain-Lernen
+    ├── modDAO.bas              Datenzugriffsschicht (alle Tabellen)
+    ├── modMailExtract.bas      Datentypen, COM-Extraktion, Header-Parser
+    ├── modBackend.bas          FE/BE-Verknüpfung, Reconnect, Migration
+    ├── modAsyncBuffer.bas      Schreib-Puffer, Batch-Flush, Datei-Queue
+    ├── modTransactionManager.bas  Transaktions-Steuerung, Safe-SQL, TLookup
+    ├── modFileManager.bas      Dateiablage, Netzwerk-Resilienz, Retry-Logik
+    ├── modOrdner.bas           Outlook-Ordner-Scan, tblOutlookOrdner-Sync
+    ├── modCID.bas              CID-Inline-Bilder: Extraktion + Pfadersatz
+    ├── modSync.bas             Sync-Orchestrierung (Hauptlogik)
+    └── test_helper/            Standalone-Testmodule (Outlook-Zugriff testen)
 ```
 
 ## Voraussetzungen
@@ -32,7 +41,7 @@
 ```
 1. Alle .bas-Dateien aus src/ in Access importieren (ALT+F11 → Datei → Importieren)
 2. Direktbereich (STRG+G):
-   ErstelleAlleTabellen       ' Erstellt alle 10 Tabellen + Indizes + Config
+   ErstelleAlleTabellen       ' Erstellt alle 12 Tabellen + Indizes + Config
 3. Sync starten:
    SyncPosteingang "MeinProjekt", "Phase1"
 ```
@@ -42,7 +51,13 @@
 ```vba
 ' === Schema ===
 ErstelleAlleTabellen                    ' Tabellen erstellen (einmalig)
+SchemaAktualisieren                     ' Fehlende Spalten/Indizes nachziehen
 LoescheAlleTabellen                     ' ACHTUNG: Löscht alle Daten!
+
+' === Backend ===
+VerknuepfeBackend "\\Server\Share\OutlookSync_BE.accdb"
+TrenneBackend
+? BackendStatus()
 
 ' === Sync ===
 SyncPosteingang                         ' Posteingang (Defaults)
@@ -50,16 +65,17 @@ SyncPosteingang "FLIWAS", "Test", 50    ' Max 50 Mails
 SyncOrdner "Postfach\Posteingang\FLIWAS", "FLIWAS", "Prod"
 
 ' === Ordnerstruktur ===
+ScanneAlleOrdner                        ' Alle Outlook-Ordner in DB einlesen
 SyncOrdnerStruktur 3                    ' Alle Ordner bis Tiefe 3 in DB
 
-' === Testmodul (standalone) ===
+' === Testmodule (test_helper/) ===
 CheckOutlookAccessMethods               ' Schnelltest Zugriffswege
 CheckOutlookDeepAccess                  ' 11-Test Suite
 AnalyzeSingleEmail                      ' Mail vollständig sezieren
 ShowFolderTree 3                        ' Ordnerstruktur anzeigen
 ```
 
-## Tabellen (10 Stück)
+## Tabellen (12 Stück)
 
 | Tabelle | Zweck |
 |---------|-------|
@@ -73,6 +89,8 @@ ShowFolderTree 3                        ' Ordnerstruktur anzeigen
 | `tblEmailEmpfaenger` | Empfänger je Mail (To/CC/BCC) |
 | `tblEmailAnhaenge` | Anhang-Metadaten + Dateipfade |
 | `tblEmailStatus` | Status-Historie |
+| `tblSyncProfil` | Gespeicherte Sync-Profile |
+| `tblSyncProfilOrdner` | Ordner je Sync-Profil |
 
 ## Konfiguration (tblConfig)
 
@@ -83,7 +101,13 @@ ShowFolderTree 3                        ' Ordnerstruktur anzeigen
 | AnhaengeExtrahieren | 1 | Anhänge auf Festplatte (1=Ja) |
 | MSGExportieren | 1 | MSG-Dateien exportieren (1=Ja) |
 | SignaturBilderFiltern | 1 | Signatur-Bilder überspringen |
-| LogLevel | 3 | 0=Aus, 1=Error, 2=Warn, 3=Info, 4=Debug |
+| LogLevel | 3 | 0=Aus, 1=Error, 2=Warn, 3=Info, 4=Debug, 5=Trace |
+| SchemaVersion | 0.5 | Aktuelle Schema-Version |
+| BackendPfad | *(leer)* | Pfad zur Backend-.accdb (leer = lokal) |
+| TempPfad | *(leer)* | Temp-Verzeichnis (leer = %TEMP%\OutlookSync\) |
+| BufferGroesse | 25 | Mails im Puffer vor Flush (5–500) |
+| NetzwerkRetries | 3 | Wiederholungen bei Datei-Kopie-Fehler |
+| NetzwerkRetryPause | 2000 | Millisekunden Basis-Pause |
 
 ## Testergebnisse (modOutlookTest)
 
