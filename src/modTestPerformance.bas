@@ -122,6 +122,27 @@ Private m_lngLetzteHashZeit As Long     ' Letzte Hash-Benchmark-Zeit (fuer Bewer
 
 
 ' ===========================================================================
+' SICHERHEITS-HELFER: Offene Transaktionen bereinigen
+' ===========================================================================
+
+' Rollt alle offenen DAO-Transaktionen sicher zurueck.
+' Verhindert Kaskadierfehler zwischen Test-Sektionen.
+' Inspiriert von mdl_Transaction_Manager.ForceCleanup.
+Private Sub SichereRollback()
+    On Error Resume Next
+    Dim i As Integer
+    For i = 1 To 10  ' Sicherheitsbremse
+        DBEngine.Workspaces(0).Rollback
+        If Err.Number <> 0 Then
+            Err.Clear
+            Exit For  ' Keine offenen Transaktionen mehr (Error 3034)
+        End If
+    Next i
+    On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
 ' HAUPT-EINSTIEGSPUNKT
 ' ===========================================================================
 
@@ -224,22 +245,27 @@ Public Sub TestDBPerformance(Optional ByVal strNetzwerkPfad As String = "", _
     If VerknuepeTestTabellen() Then
         Debug.Print ""
         TestBatchSchreiben_Linked
+        SichereRollback  ' Sicherheit: offene Transaktionen bereinigen
         Debug.Print ""
         TestSchreibMethoden_Linked
+        SichereRollback
     Else
         Debug.Print "*** Linked-Table-Tests uebersprungen (Verknuepfung fehlgeschlagen)"
     End If
 
     ' Verknuepfungen wieder entfernen
+    SichereRollback
     EntferneTestVerknuepfungen
     Debug.Print ""
 
     ' --- Schritt 3: Direct DAO Tests ---
     TestBatchSchreiben_Direct
+    SichereRollback
     Debug.Print ""
 
     ' --- Schritt 4: Memo-Feld Tests ---
     TestMemoSchreiben
+    SichereRollback
     Debug.Print ""
 
     ' --- Schritt 5: Hash-Lookup Tests ---
@@ -445,7 +471,11 @@ Private Function RunBatchWriteTest_Linked(ByVal lngBatchGroesse As Long, _
     t1 = GetTickCount()
     lngBatchCount = 0
 
-    If blnTransaction Then ws.BeginTrans
+    Dim blnTransOpen As Boolean: blnTransOpen = False
+    If blnTransaction Then
+        ws.BeginTrans
+        blnTransOpen = True
+    End If
 
     For n = 1 To m_lngAnzahlRecords
         rs.AddNew
@@ -466,17 +496,25 @@ Private Function RunBatchWriteTest_Linked(ByVal lngBatchGroesse As Long, _
 
         ' Batch-Grenze: Commit + neuer Trans
         If blnTransaction And lngBatchCount >= lngBatchGroesse Then
+            rs.Close: Set rs = Nothing
             ws.CommitTrans
+            blnTransOpen = False
             DoEvents
             ws.BeginTrans
+            blnTransOpen = True
+            Set rs = db.OpenRecordset("tblPerfTest_Emails", dbOpenDynaset)
             lngBatchCount = 0
         End If
     Next n
 
-    If blnTransaction And lngBatchCount > 0 Then ws.CommitTrans
+    ' Immer offene Transaction schliessen (auch wenn lngBatchCount = 0)
+    If blnTransOpen Then
+        ws.CommitTrans
+        blnTransOpen = False
+    End If
 
     t2 = GetTickCount()
-    rs.Close: Set rs = Nothing
+    If Not rs Is Nothing Then rs.Close: Set rs = Nothing
     Set db = Nothing: Set ws = Nothing
 
     ' Ergebnis ausgeben
@@ -503,9 +541,13 @@ Private Function RunBatchWriteTest_Linked(ByVal lngBatchGroesse As Long, _
     Exit Function
 
 ErrHandler:
+    Dim strErr As String: strErr = Err.Description
+    Dim lngErr As Long: lngErr = Err.Number
     On Error Resume Next
-    If blnTransaction Then ws.Rollback
-    Debug.Print "  FEHLER bei Batch=" & lngBatchGroesse & ": " & Err.Description
+    If blnTransOpen Then ws.Rollback
+    If Not rs Is Nothing Then rs.Close
+    On Error GoTo 0
+    Debug.Print "  FEHLER bei Batch=" & lngBatchGroesse & ": [" & lngErr & "] " & strErr
     RunBatchWriteTest_Linked = -1
 End Function
 
@@ -535,10 +577,11 @@ Private Sub TestSchreibMethoden_Linked()
     db.Execute "DELETE FROM tblPerfTest_Emails", dbFailOnError
     Dim rs As DAO.Recordset
     Set rs = db.OpenRecordset("tblPerfTest_Emails", dbOpenDynaset)
+    Dim blnTO As Boolean
 
     t1 = GetTickCount()
     lngBatch = 0
-    ws.BeginTrans
+    ws.BeginTrans: blnTO = True
     For n = 1 To m_lngAnzahlRecords
         rs.AddNew
         rs!Hash = GeneriereTestHash(n)
@@ -551,13 +594,16 @@ Private Sub TestSchreibMethoden_Linked()
         rs.Update
         lngBatch = lngBatch + 1
         If lngBatch >= lngBatchGroesse Then
-            ws.CommitTrans: DoEvents: ws.BeginTrans
+            rs.Close: Set rs = Nothing
+            ws.CommitTrans: blnTO = False: DoEvents
+            ws.BeginTrans: blnTO = True
+            Set rs = db.OpenRecordset("tblPerfTest_Emails", dbOpenDynaset)
             lngBatch = 0
         End If
     Next n
-    If lngBatch > 0 Then ws.CommitTrans
+    If blnTO Then ws.CommitTrans: blnTO = False
     t2 = GetTickCount()
-    rs.Close: Set rs = Nothing
+    If Not rs Is Nothing Then rs.Close: Set rs = Nothing
 
     Debug.Print PadR("Recordset.AddNew", 24) & _
                 PadR(CStr(m_lngAnzahlRecords), 10) & _
@@ -570,7 +616,7 @@ Private Sub TestSchreibMethoden_Linked()
 
     t1 = GetTickCount()
     lngBatch = 0
-    ws.BeginTrans
+    ws.BeginTrans: blnTO = True
     For n = 1 To m_lngAnzahlRecords
         db.Execute "INSERT INTO tblPerfTest_Emails " & _
             "(Hash, Betreff, Absender, AbsenderEmail, DatumGesendet, Groesse, ErstelltAm) " & _
@@ -583,11 +629,12 @@ Private Sub TestSchreibMethoden_Linked()
             "#" & Format(Now, "mm/dd/yyyy hh:nn:ss") & "#)", dbFailOnError
         lngBatch = lngBatch + 1
         If lngBatch >= lngBatchGroesse Then
-            ws.CommitTrans: DoEvents: ws.BeginTrans
+            ws.CommitTrans: blnTO = False: DoEvents
+            ws.BeginTrans: blnTO = True
             lngBatch = 0
         End If
     Next n
-    If lngBatch > 0 Then ws.CommitTrans
+    If blnTO Then ws.CommitTrans: blnTO = False
     t2 = GetTickCount()
 
     Debug.Print PadR("Execute INSERT SQL", 24) & _
@@ -610,7 +657,7 @@ Private Sub TestSchreibMethoden_Linked()
 
     t1 = GetTickCount()
     lngBatch = 0
-    ws.BeginTrans
+    ws.BeginTrans: blnTO = True
     For n = 1 To m_lngAnzahlRecords
         qd.Parameters("pHash") = GeneriereTestHash(n)
         qd.Parameters("pBetreff") = "QueryDef Test " & n
@@ -622,11 +669,12 @@ Private Sub TestSchreibMethoden_Linked()
         qd.Execute dbFailOnError
         lngBatch = lngBatch + 1
         If lngBatch >= lngBatchGroesse Then
-            ws.CommitTrans: DoEvents: ws.BeginTrans
+            ws.CommitTrans: blnTO = False: DoEvents
+            ws.BeginTrans: blnTO = True
             lngBatch = 0
         End If
     Next n
-    If lngBatch > 0 Then ws.CommitTrans
+    If blnTO Then ws.CommitTrans: blnTO = False
     t2 = GetTickCount()
     qd.Close: Set qd = Nothing
 
@@ -643,10 +691,10 @@ Private Sub TestSchreibMethoden_Linked()
     Exit Sub
 
 ErrHandler:
-    On Error Resume Next
-    ws.Rollback
-    On Error GoTo 0
-    Debug.Print "  FEHLER: " & Err.Description
+    Dim strErrSM As String: strErrSM = Err.Description
+    Dim lngErrSM As Long: lngErrSM = Err.Number
+    SichereRollback
+    Debug.Print "  FEHLER: [" & lngErrSM & "] " & strErrSM
 End Sub
 
 
@@ -722,7 +770,11 @@ Private Function RunBatchWriteTest_Direct(ByVal lngBatchGroesse As Long, _
     t1 = GetTickCount()
     lngBatchCount = 0
 
-    If blnTransaction Then ws.BeginTrans
+    Dim blnTransOpen As Boolean: blnTransOpen = False
+    If blnTransaction Then
+        ws.BeginTrans
+        blnTransOpen = True
+    End If
 
     For n = 1 To m_lngAnzahlRecords
         rs.AddNew
@@ -742,17 +794,23 @@ Private Function RunBatchWriteTest_Direct(ByVal lngBatchGroesse As Long, _
         lngBatchCount = lngBatchCount + 1
 
         If blnTransaction And lngBatchCount >= lngBatchGroesse Then
-            ws.CommitTrans
+            rs.Close: Set rs = Nothing
+            ws.CommitTrans: blnTransOpen = False
             DoEvents
-            ws.BeginTrans
+            ws.BeginTrans: blnTransOpen = True
+            Set rs = dbDirect.OpenRecordset("tblTestEmails", dbOpenDynaset)
             lngBatchCount = 0
         End If
     Next n
 
-    If blnTransaction And lngBatchCount > 0 Then ws.CommitTrans
+    ' Immer offene Transaction schliessen (auch wenn lngBatchCount = 0)
+    If blnTransOpen Then
+        ws.CommitTrans
+        blnTransOpen = False
+    End If
 
     t2 = GetTickCount()
-    rs.Close: Set rs = Nothing
+    If Not rs Is Nothing Then rs.Close: Set rs = Nothing
     dbDirect.Close: Set dbDirect = Nothing: Set ws = Nothing
 
     ' Ergebnis
@@ -778,11 +836,14 @@ Private Function RunBatchWriteTest_Direct(ByVal lngBatchGroesse As Long, _
     Exit Function
 
 ErrHandler:
+    Dim strErrD As String: strErrD = Err.Description
+    Dim lngErrD As Long: lngErrD = Err.Number
     On Error Resume Next
-    If blnTransaction Then ws.Rollback
+    If blnTransOpen Then ws.Rollback
+    If Not rs Is Nothing Then rs.Close
     If Not dbDirect Is Nothing Then dbDirect.Close
     On Error GoTo 0
-    Debug.Print "  FEHLER bei Batch=" & lngBatchGroesse & ": " & Err.Description
+    Debug.Print "  FEHLER bei Batch=" & lngBatchGroesse & ": [" & lngErrD & "] " & strErrD
     RunBatchWriteTest_Direct = -1
 End Function
 
@@ -843,29 +904,33 @@ Private Sub RunMemoWriteTest(ByVal lngKB As Long)
     End If
 
     Set rs = dbDirect.OpenRecordset("tblTestContent", dbOpenDynaset)
+    Dim blnMemoTO As Boolean
 
     t1 = GetTickCount()
     lngBatch = 0
-    ws.BeginTrans
+    ws.BeginTrans: blnMemoTO = True
 
     For n = 1 To lngCount
         rs.AddNew
         rs!EmailID = n
         rs!BodyHTML = strHTML
-        rs!BodyPlain = Left(strHTML, lngKB * 100)  ' ~10% als Plain
+        rs!BodyPlain = Left(strHTML, CLng(lngKB) * 100&)  ' ~10% als Plain
         rs!ErstelltAm = Now
         rs.Update
         lngBatch = lngBatch + 1
         If lngBatch >= 25 Then
-            ws.CommitTrans: DoEvents: ws.BeginTrans
+            rs.Close: Set rs = Nothing
+            ws.CommitTrans: blnMemoTO = False: DoEvents
+            ws.BeginTrans: blnMemoTO = True
+            Set rs = dbDirect.OpenRecordset("tblTestContent", dbOpenDynaset)
             lngBatch = 0
         End If
     Next n
 
-    If lngBatch > 0 Then ws.CommitTrans
+    If blnMemoTO Then ws.CommitTrans: blnMemoTO = False
     t2 = GetTickCount()
 
-    rs.Close: Set rs = Nothing
+    If Not rs Is Nothing Then rs.Close: Set rs = Nothing
     dbDirect.Close: Set dbDirect = Nothing: Set ws = Nothing
 
     Dim lngZeit As Long: lngZeit = t2 - t1
@@ -880,11 +945,14 @@ Private Sub RunMemoWriteTest(ByVal lngKB As Long)
     Exit Sub
 
 ErrHandler:
+    Dim strErrM As String: strErrM = Err.Description
+    Dim lngErrM As Long: lngErrM = Err.Number
     On Error Resume Next
-    ws.Rollback
+    If blnMemoTO Then ws.Rollback
+    If Not rs Is Nothing Then rs.Close
     If Not dbDirect Is Nothing Then dbDirect.Close
     On Error GoTo 0
-    Debug.Print "  FEHLER bei " & lngKB & "KB: " & Err.Description
+    Debug.Print "  FEHLER bei " & lngKB & "KB: [" & lngErrM & "] " & strErrM
 End Sub
 
 
@@ -911,7 +979,8 @@ Private Sub TestHashLookup()
     dbDirect.Execute "DELETE FROM tblTestEmails", dbFailOnError
 
     Set rs = dbDirect.OpenRecordset("tblTestEmails", dbOpenDynaset)
-    ws.BeginTrans
+    Dim blnLookupTO As Boolean
+    ws.BeginTrans: blnLookupTO = True
     For n = 1 To 1000
         rs.AddNew
         rs!Hash = GeneriereTestHash(n)
@@ -923,11 +992,14 @@ Private Sub TestHashLookup()
         rs!ErstelltAm = Now
         rs.Update
         If n Mod 100 = 0 Then
-            ws.CommitTrans: ws.BeginTrans
+            rs.Close: Set rs = Nothing
+            ws.CommitTrans: blnLookupTO = False
+            ws.BeginTrans: blnLookupTO = True
+            Set rs = dbDirect.OpenRecordset("tblTestEmails", dbOpenDynaset)
         End If
     Next n
-    ws.CommitTrans
-    rs.Close: Set rs = Nothing
+    If blnLookupTO Then ws.CommitTrans: blnLookupTO = False
+    If Not rs Is Nothing Then rs.Close: Set rs = Nothing
     Debug.Print "  -> 1000 Records eingefuegt."
     Debug.Print ""
 
@@ -1079,10 +1151,14 @@ Private Sub TestHashLookup()
     Exit Sub
 
 ErrHandler:
+    Dim strErrHL As String: strErrHL = Err.Description
+    Dim lngErrHL As Long: lngErrHL = Err.Number
     On Error Resume Next
+    SichereRollback
+    If Not rs Is Nothing Then rs.Close
     If Not dbDirect Is Nothing Then dbDirect.Close
     On Error GoTo 0
-    Debug.Print "  FEHLER: " & Err.Description
+    Debug.Print "  FEHLER: [" & lngErrHL & "] " & strErrHL
 End Sub
 
 
@@ -1557,10 +1633,10 @@ Public Sub TestHashingSpeed(Optional ByVal lngIterationen As Long = 1000)
     RunHashTest 1024, lngIterationen
 
     ' Test C: 50 KB (Body-Hash Szenario)
-    RunHashTest 50 * 1024, CLng(lngIterationen / 10)
+    RunHashTest 50& * 1024&, CLng(lngIterationen / 10)
 
     ' Test D: 500 KB (grosser HTML-Body)
-    RunHashTest 500 * 1024, CLng(lngIterationen / 100)
+    RunHashTest 500& * 1024&, CLng(lngIterationen / 100)
 
     Debug.Print String(60, "-")
     Debug.Print ""
