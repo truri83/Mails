@@ -7,6 +7,8 @@ Option Explicit
 ' ===========================================================================
 ' Zentrale Stelle fuer alle projektweiten Konstanten, MAPI-Tags,
 ' globale Objekte und die Init/Cleanup-Logik.
+'
+' v0.3: Frontend/Backend-Architektur, Async-Buffer, Multi-Store
 ' ===========================================================================
 
 ' ---------------------------------------------------------------------------

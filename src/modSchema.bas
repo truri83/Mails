@@ -18,7 +18,7 @@ Option Explicit
 '   ErstelleAlleTabellen
 ' ===========================================================================
 
-Private Const SCHEMA_VERSION As String = "0.1"
+Private Const SCHEMA_VERSION As String = "0.3"
 
 ' ---------------------------------------------------------------------------
 ' HAUPTROUTINE: Alle Tabellen erstellen
@@ -38,6 +38,8 @@ Public Sub ErstelleAlleTabellen()
     Call Erstelle_tblEmailEmpfaenger
     Call Erstelle_tblEmailAnhaenge
     Call Erstelle_tblEmailStatus
+    Call Erstelle_tblSyncProfil
+    Call Erstelle_tblSyncProfilOrdner
 
     Call ErstelleIndizes
     Call InitStandardConfig
@@ -58,7 +60,8 @@ Public Sub LoescheAlleTabellen()
     Set db = CurrentDb
 
     ' Reihenfolge beachten (abhaengige Tabellen zuerst)
-    tblNames = Array("tblEmailStatus", "tblEmailAnhaenge", "tblEmailEmpfaenger", _
+    tblNames = Array("tblSyncProfilOrdner", "tblSyncProfil", _
+                     "tblEmailStatus", "tblEmailAnhaenge", "tblEmailEmpfaenger", _
                      "tblEmailContent", "tblEmails", "tblEmailThreads", _
                      "tblOutlookOrdner", "tblKontakte", "tblSyncLauf", "tblConfig")
 
@@ -173,6 +176,7 @@ Private Sub Erstelle_tblOutlookOrdner()
         "  OrdnerPfad TEXT(255)," & _
         "  ParentID LONG DEFAULT 0," & _
         "  PostfachName TEXT(255)," & _
+        "  StoreID TEXT(255)," & _
         "  ElementAnzahl LONG DEFAULT 0," & _
         "  LetzterSync DATETIME" & _
         ")"
@@ -327,6 +331,57 @@ Private Sub Erstelle_tblEmailStatus()
 End Sub
 
 
+' ---------------------------------------------------------------------------
+' tblSyncProfil - Gespeicherte Sync-Profile (selektiver Sync)
+' ---------------------------------------------------------------------------
+Private Sub Erstelle_tblSyncProfil()
+    If TabelleExistiert("tblSyncProfil") Then
+        Debug.Print "  [SKIP] tblSyncProfil (existiert bereits)"
+        Exit Sub
+    End If
+
+    CurrentDb.Execute _
+        "CREATE TABLE tblSyncProfil (" & _
+        "  ProfilID AUTOINCREMENT CONSTRAINT PK_SyncProfil PRIMARY KEY," & _
+        "  ProfilName TEXT(100) NOT NULL," & _
+        "  Beschreibung TEXT(255)," & _
+        "  IstAktiv YESNO," & _
+        "  Projekt TEXT(100)," & _
+        "  Phase TEXT(100)," & _
+        "  MaxMailsProOrdner LONG DEFAULT 500," & _
+        "  MaxTiefe SHORT DEFAULT 5," & _
+        "  ExportPfad TEXT(255)," & _
+        "  ErstelltAm DATETIME" & _
+        ")"
+
+    CurrentDb.Execute "CREATE UNIQUE INDEX idx_Profil_Name ON tblSyncProfil (ProfilName)"
+    Debug.Print "  [OK  ] tblSyncProfil"
+End Sub
+
+
+' ---------------------------------------------------------------------------
+' tblSyncProfilOrdner - Ordnerauswahl je Profil
+' ---------------------------------------------------------------------------
+Private Sub Erstelle_tblSyncProfilOrdner()
+    If TabelleExistiert("tblSyncProfilOrdner") Then
+        Debug.Print "  [SKIP] tblSyncProfilOrdner (existiert bereits)"
+        Exit Sub
+    End If
+
+    CurrentDb.Execute _
+        "CREATE TABLE tblSyncProfilOrdner (" & _
+        "  ID AUTOINCREMENT CONSTRAINT PK_SyncProfilOrdner PRIMARY KEY," & _
+        "  ProfilID LONG NOT NULL," & _
+        "  OrdnerPfad TEXT(255) NOT NULL," & _
+        "  PostfachName TEXT(255)," & _
+        "  IstAktiv YESNO" & _
+        ")"
+
+    CurrentDb.Execute "CREATE INDEX idx_ProfilOrdner_Profil ON tblSyncProfilOrdner (ProfilID)"
+    Debug.Print "  [OK  ] tblSyncProfilOrdner"
+End Sub
+
+
 ' ===========================================================================
 ' INDIZES FUER HAUPTTABELLE
 ' ===========================================================================
@@ -373,6 +428,16 @@ Public Sub InitStandardConfig()
                     "Log-Level (0=Aus 1=Error 2=Warn 3=Info 4=Debug 5=Trace)")
     Call SetzeConfig(db, "SchemaVersion", SCHEMA_VERSION, _
                     "Aktuelle Schema-Version")
+    Call SetzeConfig(db, "BackendPfad", "", _
+                    "Pfad zur Backend-Datenbank (leer = lokal)")
+    Call SetzeConfig(db, "TempPfad", "", _
+                    "Temp-Verzeichnis fuer Extraktion (leer = %TEMP%\OutlookSync\)")
+    Call SetzeConfig(db, "BufferGroesse", "25", _
+                    "Anzahl Mails im Schreib-Puffer vor Flush (5-500)")
+    Call SetzeConfig(db, "NetzwerkRetries", "3", _
+                    "Anzahl Wiederholungsversuche bei Netzwerkfehlern")
+    Call SetzeConfig(db, "NetzwerkRetryPause", "2000", _
+                    "Millisekunden Pause zwischen Netzwerk-Retries")
     On Error GoTo 0
 
     Debug.Print "  [OK  ] Standardkonfiguration gesetzt"

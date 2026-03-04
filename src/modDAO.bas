@@ -171,11 +171,13 @@ End Function
 ' ===================================================================
 
 ' Ordner in DB speichern oder aktualisieren -> gibt OrdnerID zurueck
+' v0.3: StoreID-Parameter fuer Multi-Store/Archive-Unterstuetzung
 Public Function SpeichereOrdner(ByVal strName As String, _
                                  ByVal strPfad As String, _
                                  Optional ByVal lngParentID As Long = 0, _
                                  Optional ByVal strPostfach As String = "", _
-                                 Optional ByVal lngElemente As Long = 0) As Long
+                                 Optional ByVal lngElemente As Long = 0, _
+                                 Optional ByVal strStoreID As String = "") As Long
     On Error GoTo ErrHandler
     Dim db As DAO.Database, rs As DAO.Recordset
     Dim varID As Variant
@@ -205,6 +207,12 @@ Public Function SpeichereOrdner(ByVal strName As String, _
         !PostfachName = Left(Nz(strPostfach, ""), 255)
         !ElementAnzahl = lngElemente
         !LetzterSync = Now
+        If strStoreID <> "" Then
+            On Error Resume Next
+            !StoreID = Left(strStoreID, 255)
+            If Err.Number <> 0 Then Err.Clear
+            On Error GoTo ErrHandler
+        End If
         .Update
         .Bookmark = .LastModified
         SpeichereOrdner = !OrdnerID
