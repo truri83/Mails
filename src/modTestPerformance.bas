@@ -116,6 +116,9 @@ Private m_strNetzwerkPfad   As String   ' Netzwerk-Basispfad (User-Eingabe)
 Private m_strTestDBPfad     As String   ' Voller Pfad zur Test-Backend-DB
 Private m_lngAnzahlRecords  As Long     ' Anzahl Test-Records pro Test
 Private m_curFrequency      As Currency ' QPC Frequenz fuer Zeitmessung
+Private m_lngBaselineLinked As Long     ' Baseline-Zeit Linked Tables (ohne Trans)
+Private m_lngBaselineDirect As Long     ' Baseline-Zeit Direct DAO (ohne Trans)
+Private m_lngLetzteHashZeit As Long     ' Letzte Hash-Benchmark-Zeit (fuer Bewertung)
 
 
 ' ===========================================================================
@@ -505,9 +508,6 @@ ErrHandler:
     Debug.Print "  FEHLER bei Batch=" & lngBatchGroesse & ": " & Err.Description
     RunBatchWriteTest_Linked = -1
 End Function
-
-Private m_lngBaselineLinked As Long
-Private m_lngBaselineDirect As Long
 
 
 ' ---------------------------------------------------------------------------
@@ -1579,8 +1579,6 @@ Public Sub TestHashingSpeed(Optional ByVal lngIterationen As Long = 1000)
 ErrHandler:
     Debug.Print "*** FEHLER: " & Err.Description
 End Sub
-
-Private m_lngLetzteHashZeit As Long
 
 Private Sub RunHashTest(ByVal lngBytes As Long, ByVal lngAnzahl As Long)
     On Error GoTo ErrHandler
