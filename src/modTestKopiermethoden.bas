@@ -152,11 +152,10 @@ Public Sub TestAlleKopiermethoden(Optional ByVal strNetzwerkPfad As String = "",
     Debug.Print "  Ziel        : " & m_strNetzwerkDir
     Debug.Print "  Testdatei   : " & m_lngTestDateiMB & " MB"
     Debug.Print "  Zeitpunkt   : " & Now()
-    Debug.Print "  VBA7/64-Bit : " & _
 #If VBA7 Then
-        "Ja"
+    Debug.Print "  VBA7/64-Bit : Ja"
 #Else
-        "Nein"
+    Debug.Print "  VBA7/64-Bit : Nein"
 #End If
     Debug.Print String(80, "=")
     Debug.Print ""
