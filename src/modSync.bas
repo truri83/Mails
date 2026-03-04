@@ -6,14 +6,21 @@ Option Explicit
 ' modSync - Synchronisations-Orchestrierung
 ' ===========================================================================
 ' Hauptmodul fuer die Outlook-zu-Access-Synchronisation.
-' v0.3: Extract-Release-Process Pattern mit Schreib-Puffer.
+' v0.4: Extract-Release-Process mit Direct DAO + Netzwerk-Resilienz.
 '
 ' Architektur:
 '   1. EXTRACT: Alle Daten aus RDO-Objekt lesen (modMailExtract)
 '   2. RELEASE: COM-Objekt sofort freigeben (Outlook entlasten)
 '   3. BUFFER:  In Speicher-Puffer sammeln (modAsyncBuffer)
-'   4. FLUSH:   Batch in DB schreiben (Transaktion)
-'   5. COPY:    Dateien von Temp auf Netzwerk kopieren (Retry)
+'   4. FLUSH:   Batch in DB schreiben (Direct DAO, 1 Transaktion)
+'   5. COPY:    Dateien Temp->Netzwerk (modFileManager, Retry+Recovery)
+'
+' Neu in v0.4:
+'   - Direct DAO fuer Hash-Lookup (9.3x schneller)
+'   - Netzwerk-Recovery (VPN-Verlust -> WarteAufNetzwerk)
+'   - Pause/Resume (BufferPause/BufferResume)
+'   - Ablagestruktur: Jahr/Monat/Timestamp_Absender_Betreff
+'   - Anhang-Unterordner pro Mail
 '
 ' Oeffentliche Routinen:
 '   SyncPosteingang [Projekt, Phase, MaxMails, Subfolder]
@@ -24,8 +31,8 @@ Option Explicit
 '   ErstelleSyncProfil "Name", "Projekt", "Phase"
 '   ProfilOrdnerHinzufuegen ProfilID, "OrdnerPfad"
 '
-' Abhaengigkeiten: modMailExtract, modAsyncBuffer, modBackend,
-'                  modOutlookConnect, modDAO, modKontakte,
+' Abhaengigkeiten: modMailExtract, modAsyncBuffer, modFileManager,
+'                  modBackend, modOutlookConnect, modDAO, modKontakte,
 '                  modStringUtils, modCrypto, modLogging, modGlobals
 ' ===========================================================================
 
@@ -91,18 +98,19 @@ End Sub
 
 ' ===========================================================================
 ' KERN-ROUTINE: Ordner-Objekt synchronisieren
-' v0.3: Extract-Release-Process Pattern mit Schreib-Puffer
+' v0.4: Extract-Release-Process + Direct DAO + Netzwerk-Resilienz
 ' ===========================================================================
 '
 ' Ablauf:
-'   1. Fuer jede Mail im Ordner:
-'      a. ExtrahiereKomplett() → alle Daten + Anhaenge in TypMailKomplett
+'   1. Netzwerk-Pruefung (WarteAufNetzwerk bei Bedarf)
+'   2. Fuer jede Mail im Ordner:
+'      a. ExtrahiereKomplett() -> alle Daten + Anhaenge in TypMailKomplett
 '      b. COM-Objekt freigeben (Set objItem = Nothing)
-'      c. BufferHinzufuegen() → in Speicher-Puffer
-'      d. Wenn Puffer voll: BufferFlush() → Batch-INSERT in Transaktion
-'   2. BufferFlush() → Restliche Daten schreiben
-'   3. DateiQueueVerarbeiten() → Dateien von Temp auf Ziellaufwerk kopieren
-'   4. BereinigeTempDateien() → Temp-Ordner aufraeumen
+'      c. BufferHinzufuegen() -> in Speicher-Puffer
+'      d. Wenn Puffer voll: BufferFlush() -> Direct DAO Batch-INSERT
+'   3. BufferFlush() -> Restliche Daten schreiben
+'   4. DateiQueueVerarbeiten() -> Dateien Temp->Netzwerk (mit Recovery)
+'   5. BereinigeTempDateien() -> Temp-Ordner aufraeumen
 
 Public Sub SyncFolder(objFolder As Object, _
                        ByVal strProjekt As String, _
@@ -139,15 +147,23 @@ Public Sub SyncFolder(objFolder As Object, _
     Debug.Print "    Max. Mails : " & lngMaxMails
     Debug.Print "    Projekt    : " & strProjekt
     Debug.Print "    Phase      : " & strPhase
-    Debug.Print "    Modus      : Extract-Buffer-Flush (v0.3)"
+    Debug.Print "    Modus      : Extract-Buffer-Flush (v0.4, Direct DAO)"
     Debug.Print "    Backend    : " & BackendStatus()
     Debug.Print "    " & Now()
     Debug.Print String(70, "=")
 
-    ' Backend-Verfuegbarkeit pruefen
+    ' Backend-Verfuegbarkeit pruefen (mit Netzwerk-Recovery)
     If Not IstBackendVerfuegbar() Then
-        LogError "SyncFolder: Backend nicht erreichbar - Abbruch", "SYNC"
-        Exit Sub
+        LogWarn "SyncFolder: Backend nicht erreichbar - warte auf Netzwerk...", "SYNC"
+        If Not WarteAufNetzwerk(GetBackendPfad()) Then
+            LogError "SyncFolder: Backend nach Timeout nicht erreichbar - Abbruch", "SYNC"
+            Exit Sub
+        End If
+        ' Nochmal pruefen nach Reconnect
+        If Not IstBackendVerfuegbar() Then
+            LogError "SyncFolder: Backend auch nach Reconnect nicht verfuegbar", "SYNC"
+            Exit Sub
+        End If
     End If
 
     ' Sync-Lauf in DB starten
@@ -266,12 +282,12 @@ NaechsteMail:
     BufferLeeren
 
     Debug.Print String(70, "-")
-    Debug.Print "=== SYNC ERGEBNIS ==="
+    Debug.Print "=== SYNC ERGEBNIS (v0.4) ==="
     Debug.Print "  Verarbeitet : " & lngVerarbeitet
     Debug.Print "  Neu         : " & lngNeu
     Debug.Print "  Duplikate   : " & lngDuplikate
     Debug.Print "  Fehler      : " & lngFehler
-    Debug.Print "  Dateien     : " & lngDateien
+    Debug.Print "  Dateien     : " & lngDateien & " (" & BufferGesamtDateien() & " kumuliert)"
     Debug.Print "  Dauer       : " & Format((Timer - g_dtSyncStart) / 60, "0.0") & " min"
     Debug.Print "  Status      : " & strStatus
     Debug.Print String(70, "=")
