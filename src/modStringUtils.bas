@@ -34,10 +34,14 @@ Option Explicit
 '   BaueAblagePfad        - Basis/Projekt/Phase/Jahr/Monat
 '   KuerzePfadSicher      - MAX_PATH-sichere Kuerzung
 '
+' ALLGEMEIN:
+'   SafeText               - Null-sicheres Left(Nz(x), n)
+'
 ' DOMAIN/INSTITUTION:
 '   ExtrahiereDomain       - user@rps.bwl.de -> rps.bwl.de
 '   ExtrahiereInstitution  - Domain -> RPS, LUBW etc.
 '   BildeSortiername       - Nachname, Vorname
+'   BereinigeOutlookPfad   - MAPI-Pfad normalisieren
 '
 ' Abhaengigkeiten: modLogging (nur fuer ErstelleOrdner-Fehler)
 ' ===========================================================================
@@ -641,4 +645,56 @@ Public Function KuerzePfadSicher(ByVal strPfad As String, _
         ' Kein Separator: einfach abschneiden
         KuerzePfadSicher = Left(strPfad, lngMaxLen)
     End If
+End Function
+
+
+' ===========================================================================
+' SAFE TEXT - Null-sicheres Kuerzen (v0.4.1)
+' ===========================================================================
+
+' Universelle Abkuerzung fuer das ueberall vorkommende Pattern:
+'   Left(Nz(varWert, ""), intMaxLen)
+'
+' Parameter:
+'   varWert     - Variant (kann Null/Nothing/String sein)
+'   intMaxLen   - Maximale Laenge (Default 255, typisch fuer TEXT-Felder)
+'   strDefault  - Fallback wenn Null/leer (Default "")
+'
+' Beispiel: SafeText(objMail.Subject, 255) statt Left(Nz(objMail.Subject, ""), 255)
+Public Function SafeText(ByVal varWert As Variant, _
+                          Optional ByVal intMaxLen As Integer = 255, _
+                          Optional ByVal strDefault As String = "") As String
+    Dim s As String
+    s = Nz(varWert, strDefault)
+    If Len(s) > intMaxLen Then s = Left(s, intMaxLen)
+    SafeText = s
+End Function
+
+
+' ===========================================================================
+' OUTLOOK-PFAD BEREINIGEN (v0.4.1)
+' ===========================================================================
+
+' Bereinigt einen Outlook-MAPI-Ordnerpfad:
+'   - Fuehrende "\\" entfernen (Namespace-Prefix)
+'   - Doppelte Backslashes normalisieren
+'   - URL-kodierte Slashes dekodieren (%2F)
+'
+' Wird von OeffneOrdner (modOutlookConnect) verwendet.
+Public Function BereinigeOutlookPfad(ByVal strPfad As String) As String
+    If Len(strPfad) = 0 Then
+        BereinigeOutlookPfad = ""
+        Exit Function
+    End If
+
+    ' Fuehrende "\\" vom MAPI-Namespace entfernen
+    If Left(strPfad, 2) = "\\" Then strPfad = Mid(strPfad, 3)
+
+    ' URL-kodierte Slashes (aus Webmail/EWS)
+    strPfad = Replace(strPfad, "%2F", "/")
+
+    ' Doppelte Backslashes normalisieren
+    strPfad = Replace(strPfad, "\\", "\")
+
+    BereinigeOutlookPfad = strPfad
 End Function

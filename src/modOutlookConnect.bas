@@ -244,9 +244,8 @@ Public Function OeffneOrdner(ByVal strPfad As String) As Object
         Exit Function
     End If
 
-    ' Pfad bereinigen
-    If Left(strPfad, 2) = "\\" Then strPfad = Mid(strPfad, 3)
-    strPfad = Replace(strPfad, "\\", "\")
+    ' Pfad bereinigen (zentralisiert in modStringUtils)
+    strPfad = BereinigeOutlookPfad(strPfad)
 
     Dim arrTeile() As String
     arrTeile = Split(strPfad, "\")
