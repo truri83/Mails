@@ -25,9 +25,9 @@ Option Explicit
 '   ? IstBackendVerfuegbar()
 '   ? BackendStatus()
 '
-' Abhaengigkeiten: modSchema (TabelleExistiert, ErstelleAlleTabellen),
-'                  modStringUtils (NormalisierePfad, ErstelleOrdner),
-'                  modLogging
+' Abhaengigkeiten: modSchema (Tabellenkonstanten, ErstelleAlleTabellen),
+'                  modDDL (DDL_TabelleExistiert, DDL_IstVerknuepft),
+'                  modStringUtils (ErstelleOrdner), modLogging
 ' ===========================================================================
 
 
@@ -35,16 +35,12 @@ Option Explicit
 ' TABELLEN-KLASSIFIKATION
 ' ---------------------------------------------------------------------------
 
-' Backend-Tabellen (werden auf Netzlaufwerk verknuepft)
 Private Function GetBackendTabellen() As Variant
-    GetBackendTabellen = Array("tblSyncLauf", "tblKontakte", "tblOutlookOrdner", _
-                                "tblEmailThreads", "tblEmails", "tblEmailContent", _
-                                "tblEmailEmpfaenger", "tblEmailAnhaenge", "tblEmailStatus")
+    GetBackendTabellen = Array(TBL_SYNC_LAUF, TBL_KONTAKTE, TBL_ORDNER, TBL_THREADS, TBL_EMAILS, TBL_CONTENT, TBL_EMPFAENGER, TBL_ANHAENGE, TBL_EMAIL_STATUS)
 End Function
 
-' Frontend-Tabellen (bleiben immer lokal)
 Private Function GetFrontendTabellen() As Variant
-    GetFrontendTabellen = Array("tblConfig", "tblSyncProfil", "tblSyncProfilOrdner")
+    GetFrontendTabellen = Array(TBL_CONFIG, TBL_PROFIL, TBL_PROFIL_ORDNER)
 End Function
 
 
@@ -52,14 +48,6 @@ End Function
 ' BACKEND VERKNUEPFEN
 ' ===========================================================================
 
-' Verknuepft alle Datentabellen mit einer Backend-Datenbank auf Netzlaufwerk.
-' Erstellt die Backend-DB wenn sie nicht existiert.
-' Migriert bestehende lokale Daten automatisch ins Backend.
-'
-' Parameter:
-'   strBackendPfad - Vollstaendiger Pfad zur Backend-.accdb
-'                    z.B. "\\Server\Share\OutlookSync_BE.accdb"
-'                    oder "S:\Daten\OutlookSync_BE.accdb"
 Public Function VerknuepfeBackend(ByVal strBackendPfad As String) As Boolean
     On Error GoTo ErrHandler
 
@@ -134,8 +122,6 @@ End Function
 ' BACKEND TRENNEN
 ' ===========================================================================
 
-' Entfernt alle Verknuepfungen und stellt lokale Tabellen wieder her.
-' ACHTUNG: Die Daten bleiben im Backend, lokal werden leere Tabellen erstellt.
 Public Sub TrenneBackend()
     On Error GoTo ErrHandler
 
@@ -147,13 +133,11 @@ Public Sub TrenneBackend()
     Debug.Print "=== BACKEND TRENNEN ==="
 
     For i = LBound(arrTabellen) To UBound(arrTabellen)
-        Call EntferneVerknuepfung(CStr(arrTabellen(i)))
+        EntferneVerknuepfung CStr(arrTabellen(i))
     Next i
 
-    ' Backend-Pfad aus Config entfernen
     SchreibeConfig "BackendPfad", ""
 
-    ' Lokale Tabellen neu erstellen
     Debug.Print "  Erstelle lokale Tabellen..."
     ErstelleAlleTabellen
 
@@ -172,15 +156,12 @@ End Sub
 ' BACKEND-STATUS PRUEFEN
 ' ===========================================================================
 
-' Prueft ob das konfigurierte Backend erreichbar ist
-' Wenn kein Backend konfiguriert: TRUE (lokal = immer verfuegbar)
 Public Function IstBackendVerfuegbar() As Boolean
     On Error Resume Next
     Dim strPfad As String
     strPfad = LeseConfig("BackendPfad", "")
 
     If strPfad = "" Then
-        ' Kein Backend konfiguriert = lokaler Modus = immer verfuegbar
         IstBackendVerfuegbar = True
         Exit Function
     End If
@@ -189,8 +170,6 @@ Public Function IstBackendVerfuegbar() As Boolean
     On Error GoTo 0
 End Function
 
-
-' Gibt eine menschenlesbare Status-Zusammenfassung zurueck
 Public Function BackendStatus() As String
     Dim strPfad As String
     strPfad = LeseConfig("BackendPfad", "")
@@ -207,25 +186,19 @@ Public Function BackendStatus() As String
     End If
 End Function
 
-
-' Prueft ob aktuell ein Backend verknuepft ist
 Public Function IstBackendVerknuepft() As Boolean
     IstBackendVerknuepft = (LeseConfig("BackendPfad", "") <> "")
 End Function
 
-
-' Gibt den konfigurierten Backend-Pfad zurueck (leer wenn lokal)
 Public Function GetBackendPfad() As String
     GetBackendPfad = LeseConfig("BackendPfad", "")
 End Function
 
-
-' Prueft ob eine Tabelle eine Frontend-Tabelle ist (bleibt lokal)
 Public Function IstFETabelle(ByVal strTabelle As String) As Boolean
     Dim arr As Variant, v As Variant
     arr = GetFrontendTabellen()
     For Each v In arr
-        If LCase(CStr(v)) = LCase(strTabelle) Then
+        If StrComp(CStr(v), strTabelle, vbTextCompare) = 0 Then
             IstFETabelle = True
             Exit Function
         End If
@@ -233,13 +206,23 @@ Public Function IstFETabelle(ByVal strTabelle As String) As Boolean
     IstFETabelle = False
 End Function
 
+Public Function IstBETabelle(ByVal strTabelle As String) As Boolean
+    Dim arr As Variant, v As Variant
+    arr = GetBackendTabellen()
+    For Each v In arr
+        If StrComp(CStr(v), strTabelle, vbTextCompare) = 0 Then
+            IstBETabelle = True
+            Exit Function
+        End If
+    Next v
+    IstBETabelle = False
+End Function
+
 
 ' ===========================================================================
 ' RECONNECT (nach Netzwerk-Unterbrechung)
 ' ===========================================================================
 
-' Versucht die Backend-Verbindung wiederherzustellen
-' (Linked Table Links refreshen)
 Public Function ReconnectBackend() As Boolean
     On Error GoTo ErrHandler
 
@@ -247,7 +230,7 @@ Public Function ReconnectBackend() As Boolean
     strPfad = LeseConfig("BackendPfad", "")
 
     If strPfad = "" Then
-        ReconnectBackend = True  ' Lokal = immer OK
+        ReconnectBackend = True
         Exit Function
     End If
 
@@ -257,12 +240,11 @@ Public Function ReconnectBackend() As Boolean
         Exit Function
     End If
 
-    ' Links refreshen
     Dim arrTabellen As Variant, i As Long
     arrTabellen = GetBackendTabellen()
 
     For i = LBound(arrTabellen) To UBound(arrTabellen)
-        Call RefreshLink(CStr(arrTabellen(i)), strPfad)
+        RefreshLink CStr(arrTabellen(i)), strPfad
     Next i
 
     LogInfo "Backend Reconnect erfolgreich: " & strPfad, "BACKEND"
@@ -279,34 +261,26 @@ End Function
 ' PRIVATE: TABELLEN-VERKNUEPFUNG
 ' ===========================================================================
 
-' Einzelne Tabelle mit Backend verknuepfen
-' Migriert bestehende lokale Daten automatisch
-Private Function VerknuepfeTabelle(ByVal strTabelle As String, _
-                                    ByVal strBackendDB As String) As Boolean
+Private Function VerknuepfeTabelle(ByVal strTabelle As String, ByVal strBackendDB As String) As Boolean
     On Error GoTo ErrHandler
 
     Dim db As DAO.Database
     Set db = CurrentDb
 
-    ' 1. Wenn lokale (nicht-verknuepfte) Tabelle existiert: Daten migrieren
-    If TabelleExistiert(strTabelle) Then
+    If DDL_TabelleExistiert(strTabelle) Then
         Dim td As DAO.TableDef
         Set td = db.TableDefs(strTabelle)
 
         If td.Connect = "" Then
-            ' Lokale Tabelle -> Daten ins Backend kopieren
-            Call MigriereTabellenDaten(strTabelle, strBackendDB)
-            ' Lokale Tabelle loeschen
+            MigriereTabellenDaten strTabelle, strBackendDB
             db.Execute "DROP TABLE [" & strTabelle & "]"
             db.TableDefs.Refresh
             Debug.Print "  [MIGRIERT] " & strTabelle
         Else
-            ' Bereits verknuepft -> nur Link aktualisieren
-            Call EntferneVerknuepfung(strTabelle)
+            EntferneVerknuepfung strTabelle
         End If
     End If
 
-    ' 2. Verknuepfung erstellen
     Dim tdNew As DAO.TableDef
     Set tdNew = db.CreateTableDef(strTabelle)
     tdNew.Connect = ";DATABASE=" & strBackendDB
@@ -325,18 +299,13 @@ ErrHandler:
     VerknuepfeTabelle = False
 End Function
 
-
-' Daten einer lokalen Tabelle ins Backend migrieren
-Private Sub MigriereTabellenDaten(ByVal strTabelle As String, _
-                                   ByVal strBackendDB As String)
+Private Sub MigriereTabellenDaten(ByVal strTabelle As String, ByVal strBackendDB As String)
     On Error GoTo ErrHandler
 
-    ' Pruefen ob lokale Tabelle Daten hat
     Dim lngCount As Long
     lngCount = DCount("*", strTabelle)
     If lngCount = 0 Then Exit Sub
 
-    ' Pruefen ob Backend-Tabelle bereits Daten hat
     Dim dbBE As DAO.Database
     Set dbBE = DBEngine.OpenDatabase(strBackendDB)
 
@@ -347,32 +316,26 @@ Private Sub MigriereTabellenDaten(ByVal strTabelle As String, _
     On Error GoTo ErrHandler
 
     If lngBECount = 0 Then
-        ' Backend-Tabelle leer -> Daten kopieren
-        CurrentDb.Execute "INSERT INTO [" & strTabelle & "] IN '" & strBackendDB & "' " & _
-                          "SELECT * FROM [" & strTabelle & "]"
+        CurrentDb.Execute "INSERT INTO [" & strTabelle & "] IN '" & strBackendDB & "' SELECT * FROM [" & strTabelle & "]"
         LogInfo "Migriert: " & lngCount & " Datensaetze von " & strTabelle, "BACKEND"
         Debug.Print "    -> " & lngCount & " Datensaetze migriert"
     Else
-        LogWarn "Backend-Tabelle " & strTabelle & " hat bereits " & lngBECount & _
-                " Datensaetze, Migration uebersprungen", "BACKEND"
+        LogWarn "Backend-Tabelle " & strTabelle & " hat bereits " & lngBECount & " Datensaetze, Migration uebersprungen", "BACKEND"
     End If
 
     dbBE.Close: Set dbBE = Nothing
     Exit Sub
 
 ErrHandler:
-    LogWarn "Datenmigration fehlgeschlagen fuer " & strTabelle & ": " & _
-            Err.Description, "BACKEND"
+    LogWarn "Datenmigration fehlgeschlagen fuer " & strTabelle & ": " & Err.Description, "BACKEND"
 End Sub
 
-
-' Verknuepfung einer Tabelle entfernen
 Private Sub EntferneVerknuepfung(ByVal strTabelle As String)
     On Error Resume Next
     Dim db As DAO.Database
     Set db = CurrentDb
 
-    If TabelleExistiert(strTabelle) Then
+    If DDL_TabelleExistiert(strTabelle) Then
         db.TableDefs.Delete strTabelle
         db.TableDefs.Refresh
         Debug.Print "  [UNLINK] " & strTabelle
@@ -382,8 +345,6 @@ Private Sub EntferneVerknuepfung(ByVal strTabelle As String)
     On Error GoTo 0
 End Sub
 
-
-' Link einer verknuepften Tabelle aktualisieren
 Private Sub RefreshLink(ByVal strTabelle As String, ByVal strBackendDB As String)
     On Error Resume Next
     Dim td As DAO.TableDef
@@ -400,10 +361,11 @@ End Sub
 
 
 ' ===========================================================================
-' PRIVATE: BACKEND-DB ERSTELLEN
+' BACKEND-DB ERSTELLEN
 ' ===========================================================================
 
-' Erstellt eine neue Access-Datenbank mit allen BE-Tabellen + Indizes
+' Erstellt eine neue Backend-Datenbank mit allen BE-Tabellen.
+' Nutzt die SQL-Definitionen aus modSchema (kein doppeltes SQL).
 Private Function ErstelleBackendDB(ByVal strPfad As String) As Boolean
     On Error GoTo ErrHandler
 
@@ -416,104 +378,100 @@ Private Function ErstelleBackendDB(ByVal strPfad As String) As Boolean
     Dim dbNew As DAO.Database
     Set dbNew = DBEngine.CreateDatabase(strPfad, dbLangGeneral)
 
+    ' Backend-Tabellen in der neuen DB erstellen
+    ' (Gleiche SQL-Strings wie in modSchema, aber gegen dbNew ausgefuehrt)
+    Dim sql As String
+
     ' --- tblSyncLauf ---
-    dbNew.Execute _
-        "CREATE TABLE tblSyncLauf (" & _
-        "  SyncLaufID AUTOINCREMENT CONSTRAINT PK_SyncLauf PRIMARY KEY," & _
-        "  StartZeit DATETIME, EndeZeit DATETIME," & _
-        "  Status TEXT(20) DEFAULT 'Gestartet'," & _
-        "  AnzahlGelesen LONG DEFAULT 0, AnzahlNeu LONG DEFAULT 0," & _
-        "  AnzahlDuplikate LONG DEFAULT 0, AnzahlFehler LONG DEFAULT 0," & _
-        "  OrdnerPfad TEXT(255), Projekt TEXT(100), Phase TEXT(100))"
+    sql = "CREATE TABLE " & TBL_SYNC_LAUF & " ("
+    sql = sql & "SyncLaufID AUTOINCREMENT CONSTRAINT PK_SyncLauf PRIMARY KEY, "
+    sql = sql & "StartZeit DATETIME, EndeZeit DATETIME, Status TEXT(20), "
+    sql = sql & "AnzahlGelesen LONG, AnzahlNeu LONG, AnzahlDuplikate LONG, AnzahlFehler LONG, "
+    sql = sql & "OrdnerPfad TEXT(255), Projekt TEXT(100), Phase TEXT(100))"
+    dbNew.Execute sql
 
     ' --- tblKontakte ---
-    dbNew.Execute _
-        "CREATE TABLE tblKontakte (" & _
-        "  KontaktID AUTOINCREMENT CONSTRAINT PK_Kontakte PRIMARY KEY," & _
-        "  Anzeigename TEXT(255), Email TEXT(255), EmailTyp TEXT(10)," & _
-        "  Vorname TEXT(100), Nachname TEXT(100), Titel TEXT(50)," & _
-        "  Namenszusatz TEXT(100), Institution TEXT(255)," & _
-        "  Sortiername TEXT(255), KontaktTyp TEXT(20)," & _
-        "  ErstelltAm DATETIME, AktualisiertAm DATETIME)"
-    dbNew.Execute "CREATE INDEX idx_Kontakte_Email ON tblKontakte (Email)"
+    sql = "CREATE TABLE " & TBL_KONTAKTE & " ("
+    sql = sql & "KontaktID AUTOINCREMENT CONSTRAINT PK_Kontakte PRIMARY KEY, "
+    sql = sql & "Anzeigename TEXT(255), Email TEXT(255), EmailTyp TEXT(10), "
+    sql = sql & "Vorname TEXT(100), Nachname TEXT(100), Titel TEXT(50), "
+    sql = sql & "Namenszusatz TEXT(100), Institution TEXT(255), Sortiername TEXT(255), "
+    sql = sql & "KontaktTyp TEXT(20), ErstelltAm DATETIME, AktualisiertAm DATETIME)"
+    dbNew.Execute sql
+    dbNew.Execute "CREATE INDEX idx_Kontakte_Email ON " & TBL_KONTAKTE & " (Email)"
 
     ' --- tblOutlookOrdner ---
-    dbNew.Execute _
-        "CREATE TABLE tblOutlookOrdner (" & _
-        "  OrdnerID AUTOINCREMENT CONSTRAINT PK_Ordner PRIMARY KEY," & _
-        "  OrdnerName TEXT(255), OrdnerPfad TEXT(255)," & _
-        "  ParentID LONG DEFAULT 0, PostfachName TEXT(255)," & _
-        "  StoreID TEXT(255)," & _
-        "  ElementAnzahl LONG DEFAULT 0, LetzterSync DATETIME)"
-    dbNew.Execute "CREATE UNIQUE INDEX idx_Ordner_Pfad ON tblOutlookOrdner (OrdnerPfad)"
+    sql = "CREATE TABLE " & TBL_ORDNER & " ("
+    sql = sql & "OrdnerID AUTOINCREMENT CONSTRAINT PK_Ordner PRIMARY KEY, "
+    sql = sql & "OrdnerName TEXT(255), OrdnerPfad TEXT(255), ParentID LONG, "
+    sql = sql & "PostfachName TEXT(255), StoreID TEXT(255), ElementAnzahl LONG, LetzterSync DATETIME)"
+    dbNew.Execute sql
+    dbNew.Execute "CREATE UNIQUE INDEX idx_Ordner_Pfad ON " & TBL_ORDNER & " (OrdnerPfad)"
 
     ' --- tblEmailThreads ---
-    dbNew.Execute _
-        "CREATE TABLE tblEmailThreads (" & _
-        "  ThreadID AUTOINCREMENT CONSTRAINT PK_Threads PRIMARY KEY," & _
-        "  ThreadBetreff TEXT(255), ThreadIdentifier TEXT(255)," & _
-        "  Antwortanzahl LONG DEFAULT 1, ErsterAbsender TEXT(255)," & _
-        "  ErstesMailDatum DATETIME, LetztesMailDatum DATETIME," & _
-        "  ErstelltAm DATETIME)"
-    dbNew.Execute "CREATE UNIQUE INDEX idx_Thread_Ident ON tblEmailThreads (ThreadIdentifier)"
+    sql = "CREATE TABLE " & TBL_THREADS & " ("
+    sql = sql & "ThreadID AUTOINCREMENT CONSTRAINT PK_Threads PRIMARY KEY, "
+    sql = sql & "ThreadBetreff TEXT(255), ThreadIdentifier TEXT(255), Antwortanzahl LONG, "
+    sql = sql & "ErsterAbsender TEXT(255), ErstesMailDatum DATETIME, LetztesMailDatum DATETIME, "
+    sql = sql & "ErstelltAm DATETIME)"
+    dbNew.Execute sql
+    dbNew.Execute "CREATE UNIQUE INDEX idx_Thread_Ident ON " & TBL_THREADS & " (ThreadIdentifier)"
 
     ' --- tblEmails ---
-    dbNew.Execute _
-        "CREATE TABLE tblEmails (" & _
-        "  EmailID AUTOINCREMENT CONSTRAINT PK_Emails PRIMARY KEY," & _
-        "  OutlookEntryID TEXT(255), UniqueHash TEXT(64)," & _
-        "  ThreadID LONG DEFAULT 0, OrdnerID LONG DEFAULT 0," & _
-        "  KontaktID_Absender LONG DEFAULT 0, SyncLaufID LONG DEFAULT 0," & _
-        "  Betreff TEXT(255), BetreffBereinigt TEXT(255)," & _
-        "  AbsenderName TEXT(255), AbsenderEmail TEXT(255)," & _
-        "  EmpfangenAm DATETIME, GesendetAm DATETIME," & _
-        "  Groesse LONG DEFAULT 0, Wichtigkeit SHORT DEFAULT 1," & _
-        "  Gelesen YESNO, HatAnhaenge YESNO, AnhangAnzahl SHORT DEFAULT 0," & _
-        "  MessageClass TEXT(50), InternetMessageID TEXT(255)," & _
-        "  MSGDateiPfad TEXT(255), Status TEXT(20) DEFAULT 'Neu'," & _
-        "  ErstelltAm DATETIME)"
-    dbNew.Execute "CREATE UNIQUE INDEX idx_Email_Hash ON tblEmails (UniqueHash)"
-    dbNew.Execute "CREATE INDEX idx_Email_EntryID ON tblEmails (OutlookEntryID)"
-    dbNew.Execute "CREATE INDEX idx_Email_ThreadID ON tblEmails (ThreadID)"
-    dbNew.Execute "CREATE INDEX idx_Email_KontaktID ON tblEmails (KontaktID_Absender)"
-    dbNew.Execute "CREATE INDEX idx_Email_OrdnerID ON tblEmails (OrdnerID)"
-    dbNew.Execute "CREATE INDEX idx_Email_SyncLauf ON tblEmails (SyncLaufID)"
-    dbNew.Execute "CREATE INDEX idx_Email_Datum ON tblEmails (EmpfangenAm)"
+    sql = "CREATE TABLE " & TBL_EMAILS & " ("
+    sql = sql & "EmailID AUTOINCREMENT CONSTRAINT PK_Emails PRIMARY KEY, "
+    sql = sql & "OutlookEntryID TEXT(255), UniqueHash TEXT(64), "
+    sql = sql & "ThreadID LONG, OrdnerID LONG, KontaktID_Absender LONG, SyncLaufID LONG, "
+    sql = sql & "Betreff TEXT(255), BetreffBereinigt TEXT(255), "
+    sql = sql & "AbsenderName TEXT(255), AbsenderEmail TEXT(255), "
+    sql = sql & "EmpfangenAm DATETIME, GesendetAm DATETIME, "
+    sql = sql & "Groesse LONG, Wichtigkeit SHORT, Gelesen YESNO, HatAnhaenge YESNO, "
+    sql = sql & "AnhangAnzahl SHORT, MessageClass TEXT(50), InternetMessageID TEXT(255), "
+    sql = sql & "MSGDateiPfad TEXT(255), Status TEXT(20), ErstelltAm DATETIME)"
+    dbNew.Execute sql
+    dbNew.Execute "CREATE UNIQUE INDEX idx_Email_Hash ON " & TBL_EMAILS & " (UniqueHash)"
+    dbNew.Execute "CREATE INDEX idx_Email_EntryID ON " & TBL_EMAILS & " (OutlookEntryID)"
+    dbNew.Execute "CREATE INDEX idx_Email_ThreadID ON " & TBL_EMAILS & " (ThreadID)"
+    dbNew.Execute "CREATE INDEX idx_Email_KontaktID ON " & TBL_EMAILS & " (KontaktID_Absender)"
+    dbNew.Execute "CREATE INDEX idx_Email_OrdnerID ON " & TBL_EMAILS & " (OrdnerID)"
+    dbNew.Execute "CREATE INDEX idx_Email_SyncLauf ON " & TBL_EMAILS & " (SyncLaufID)"
+    dbNew.Execute "CREATE INDEX idx_Email_Datum ON " & TBL_EMAILS & " (EmpfangenAm)"
 
     ' --- tblEmailContent ---
-    dbNew.Execute _
-        "CREATE TABLE tblEmailContent (" & _
-        "  ContentID AUTOINCREMENT CONSTRAINT PK_Content PRIMARY KEY," & _
-        "  EmailID LONG NOT NULL, HTMLBody MEMO, PlainTextBody MEMO," & _
-        "  HatHTML YESNO, GroesseHTML LONG DEFAULT 0, GroesseText LONG DEFAULT 0)"
-    dbNew.Execute "CREATE UNIQUE INDEX idx_Content_EmailID ON tblEmailContent (EmailID)"
+    sql = "CREATE TABLE " & TBL_CONTENT & " ("
+    sql = sql & "ContentID AUTOINCREMENT CONSTRAINT PK_Content PRIMARY KEY, "
+    sql = sql & "EmailID LONG NOT NULL, HTMLBody MEMO, PlainTextBody MEMO, "
+    sql = sql & "HatHTML YESNO, GroesseHTML LONG, GroesseText LONG)"
+    dbNew.Execute sql
+    dbNew.Execute "CREATE UNIQUE INDEX idx_Content_EmailID ON " & TBL_CONTENT & " (EmailID)"
 
     ' --- tblEmailEmpfaenger ---
-    dbNew.Execute _
-        "CREATE TABLE tblEmailEmpfaenger (" & _
-        "  EmpfaengerID AUTOINCREMENT CONSTRAINT PK_Empfaenger PRIMARY KEY," & _
-        "  EmailID LONG NOT NULL, KontaktID LONG DEFAULT 0," & _
-        "  Typ TEXT(5), Anzeigename TEXT(255), Email TEXT(255))"
-    dbNew.Execute "CREATE INDEX idx_Empf_EmailID ON tblEmailEmpfaenger (EmailID)"
+    sql = "CREATE TABLE " & TBL_EMPFAENGER & " ("
+    sql = sql & "EmpfaengerID AUTOINCREMENT CONSTRAINT PK_Empfaenger PRIMARY KEY, "
+    sql = sql & "EmailID LONG NOT NULL, KontaktID LONG, Typ TEXT(5), "
+    sql = sql & "Anzeigename TEXT(255), Email TEXT(255))"
+    dbNew.Execute sql
+    dbNew.Execute "CREATE INDEX idx_Empf_EmailID ON " & TBL_EMPFAENGER & " (EmailID)"
 
     ' --- tblEmailAnhaenge ---
-    dbNew.Execute _
-        "CREATE TABLE tblEmailAnhaenge (" & _
-        "  AnhangID AUTOINCREMENT CONSTRAINT PK_Anhaenge PRIMARY KEY," & _
-        "  EmailID LONG NOT NULL, Dateiname TEXT(255)," & _
-        "  DateinameBereinigt TEXT(255), Erweiterung TEXT(20)," & _
-        "  Groesse LONG DEFAULT 0, MimeType TEXT(100)," & _
-        "  AnhangTyp SHORT DEFAULT 1, IstVersteckt YESNO," & _
-        "  IstGespeichert YESNO, DateiPfad TEXT(255), ErstelltAm DATETIME)"
-    dbNew.Execute "CREATE INDEX idx_Anh_EmailID ON tblEmailAnhaenge (EmailID)"
+    sql = "CREATE TABLE " & TBL_ANHAENGE & " ("
+    sql = sql & "AnhangID AUTOINCREMENT CONSTRAINT PK_Anhaenge PRIMARY KEY, "
+    sql = sql & "EmailID LONG NOT NULL, Dateiname TEXT(255), DateinameBereinigt TEXT(255), "
+    sql = sql & "Erweiterung TEXT(20), Groesse LONG, MimeType TEXT(100), AnhangTyp SHORT, "
+    sql = sql & "IstVersteckt YESNO, IstGespeichert YESNO, DateiPfad TEXT(255), ErstelltAm DATETIME)"
+    dbNew.Execute sql
+    dbNew.Execute "CREATE INDEX idx_Anh_EmailID ON " & TBL_ANHAENGE & " (EmailID)"
 
     ' --- tblEmailStatus ---
-    dbNew.Execute _
-        "CREATE TABLE tblEmailStatus (" & _
-        "  StatusID AUTOINCREMENT CONSTRAINT PK_EmailStatus PRIMARY KEY," & _
-        "  EmailID LONG NOT NULL, Status TEXT(50)," & _
-        "  GeaendertVon TEXT(100), Bemerkung TEXT(255), GeaendertAm DATETIME)"
-    dbNew.Execute "CREATE INDEX idx_Status_EmailID ON tblEmailStatus (EmailID)"
+    sql = "CREATE TABLE " & TBL_EMAIL_STATUS & " ("
+    sql = sql & "StatusID AUTOINCREMENT CONSTRAINT PK_EmailStatus PRIMARY KEY, "
+    sql = sql & "EmailID LONG NOT NULL, Status TEXT(50), GeaendertVon TEXT(100), "
+    sql = sql & "Bemerkung TEXT(255), GeaendertAm DATETIME)"
+    dbNew.Execute sql
+    dbNew.Execute "CREATE INDEX idx_Status_EmailID ON " & TBL_EMAIL_STATUS & " (EmailID)"
+
+    ' Defaults via DAO setzen (direkt in der Backend-DB)
+    SetzeBEDefaults dbNew
 
     dbNew.Close
     Set dbNew = Nothing
@@ -529,8 +487,54 @@ ErrHandler:
     ErstelleBackendDB = False
 End Function
 
+' Setzt Defaults in einer frisch erstellten Backend-DB via DAO
+Private Sub SetzeBEDefaults(dbBE As DAO.Database)
+    On Error Resume Next
 
-' Prueft ob eine Datei existiert und zugreifbar ist
+    SetzeFeldDefaultInDB dbBE, TBL_SYNC_LAUF, "Status", """Gestartet"""
+    SetzeFeldDefaultInDB dbBE, TBL_SYNC_LAUF, "AnzahlGelesen", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_SYNC_LAUF, "AnzahlNeu", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_SYNC_LAUF, "AnzahlDuplikate", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_SYNC_LAUF, "AnzahlFehler", "0"
+
+    SetzeFeldDefaultInDB dbBE, TBL_ORDNER, "ParentID", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_ORDNER, "ElementAnzahl", "0"
+
+    SetzeFeldDefaultInDB dbBE, TBL_THREADS, "Antwortanzahl", "1"
+
+    SetzeFeldDefaultInDB dbBE, TBL_EMAILS, "ThreadID", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_EMAILS, "OrdnerID", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_EMAILS, "KontaktID_Absender", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_EMAILS, "SyncLaufID", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_EMAILS, "Groesse", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_EMAILS, "Wichtigkeit", "1"
+    SetzeFeldDefaultInDB dbBE, TBL_EMAILS, "AnhangAnzahl", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_EMAILS, "Status", """Neu"""
+
+    SetzeFeldDefaultInDB dbBE, TBL_CONTENT, "GroesseHTML", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_CONTENT, "GroesseText", "0"
+
+    SetzeFeldDefaultInDB dbBE, TBL_EMPFAENGER, "KontaktID", "0"
+
+    SetzeFeldDefaultInDB dbBE, TBL_ANHAENGE, "Groesse", "0"
+    SetzeFeldDefaultInDB dbBE, TBL_ANHAENGE, "AnhangTyp", "1"
+
+    On Error GoTo 0
+End Sub
+
+' Setzt DefaultValue fuer ein Feld direkt in einer uebergebenen Datenbank
+Private Sub SetzeFeldDefaultInDB(db As DAO.Database, ByVal strTabelle As String, ByVal strFeld As String, ByVal strDefault As String)
+    On Error Resume Next
+    db.TableDefs(strTabelle).Fields(strFeld).DefaultValue = strDefault
+    Err.Clear
+    On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
+' PRIVATE HELFER
+' ===========================================================================
+
 Private Function PruefeDatei(ByVal strPfad As String) As Boolean
     On Error Resume Next
     PruefeDatei = (Dir(strPfad) <> "")
