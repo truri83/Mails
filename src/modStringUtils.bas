@@ -3,16 +3,43 @@ Option Compare Database
 Option Explicit
 
 ' ===========================================================================
-' modStringUtils - String-Bereinigung, Validierung und Pfad-Utilities
+' modStringUtils - String-Bereinigung, Validierung, Pfad- und Datei-Utilities
 ' ===========================================================================
-' Konsolidiert alle String-Operationen:
-'   - E-Mail-Validierung (RegExp)
-'   - Betreff-Bereinigung (RE:/AW:/FW:/WG:/EXTERN entfernen)
-'   - Dateinamen-Bereinigung (illegale Zeichen)
-'   - Kontaktinfo-Bereinigung (Name + Email)
-'   - Pfad-Normalisierung und Ordner-Erstellung
-'   - Eindeutige Dateipfad-Generierung
-'   - SQL-Escaping
+' v0.4: Zentralisiert ALLE String-/Pfad-/Dateinamen-Operationen:
+'
+' VALIDIERUNG:
+'   IstGueltigeEmail     - RegExp E-Mail-Pruefung
+'   IsAlphaOnly          - Nur Buchstaben/Umlaute/Bindestrich
+'
+' TEXT-BEREINIGUNG:
+'   BereinigeBetreff     - RE:/AW:/FW:/WG:/EXTERN entfernen
+'   BereinigeDateiname   - Illegale Zeichen, Laengenlimit
+'   BereinigeAnhangName  - Anhang-spezifisch mit Extension-Handling
+'   BereinigeKontaktInfo - Name + Email standardisieren
+'   BereinigeNameInput   - Sonderzeichen aus Namen
+'   CapitalizeWord       - Gross-/Kleinschreibung + Adelspraedikate
+'   SQLSafe              - SQL-Injection-Schutz
+'   KuerzeAbsender       - Absender auf Kurzform
+'   RTrimSpecial         - Trailing Punkte/Leerzeichen (Windows)
+'
+' DATEINAME-GENERIERUNG:
+'   GeneriereMailDateiname  - YYYYMMDD_HHNN_Absender_Betreff.ext
+'   EntferneEndung          - Extension abtrennen
+'   HoleEndung              - Extension extrahieren (lowercase)
+'
+' PFAD-OPERATIONEN:
+'   NormalisierePfad      - UNC-sicher, Trailing Backslash
+'   ErstelleOrdner        - Rekursiv mit UNC-Support
+'   EindeutigerDateipfad  - Vermeidet Ueberschreiben (Name (1).ext)
+'   BaueAblagePfad        - Basis/Projekt/Phase/Jahr/Monat
+'   KuerzePfadSicher      - MAX_PATH-sichere Kuerzung
+'
+' DOMAIN/INSTITUTION:
+'   ExtrahiereDomain       - user@rps.bwl.de -> rps.bwl.de
+'   ExtrahiereInstitution  - Domain -> RPS, LUBW etc.
+'   BildeSortiername       - Nachname, Vorname
+'
+' Abhaengigkeiten: modLogging (nur fuer ErstelleOrdner-Fehler)
 ' ===========================================================================
 
 
@@ -389,4 +416,229 @@ Public Function BildeSortiername(ByVal strNachname As String, ByVal strVorname A
     s = Trim(strNachname)
     If Len(Trim(strVorname)) > 0 Then s = s & ", " & Trim(strVorname)
     BildeSortiername = s
+End Function
+
+
+' ===========================================================================
+' ABSENDER KUERZEN (v0.4 - aus modFileManager zentralisiert)
+' ===========================================================================
+
+' Absender-Name auf Kurzform bringen:
+'   "torsten.kugler@rps.bwl.de" -> "torsten kugler"
+'   "Dr. Max Mueller" -> "Max Mueller"
+' Fuer Dateinamen und Ordnernamen geeignet.
+Public Function KuerzeAbsender(ByVal strAbsender As String, _
+                                Optional ByVal intMaxLen As Integer = 20) As String
+    If Nz(strAbsender, "") = "" Then
+        KuerzeAbsender = ""
+        Exit Function
+    End If
+
+    Dim s As String
+    s = Trim(strAbsender)
+
+    ' Wenn Email-Adresse: Teil vor @
+    Dim lngAt As Long
+    lngAt = InStr(s, "@")
+    If lngAt > 1 Then
+        s = Left(s, lngAt - 1)
+        s = Replace(s, ".", " ")
+    End If
+
+    ' Nur erstes+zweites Wort behalten
+    Dim arrTeile As Variant
+    arrTeile = Split(Trim(s), " ")
+    If UBound(arrTeile) >= 1 Then
+        s = arrTeile(0) & " " & arrTeile(1)
+    ElseIf UBound(arrTeile) >= 0 Then
+        s = arrTeile(0)
+    End If
+
+    KuerzeAbsender = Left(s, intMaxLen)
+End Function
+
+
+' ===========================================================================
+' RTRIM SPECIAL (v0.4 - Trailing Punkte/Leerzeichen/Bindestriche)
+' ===========================================================================
+
+' Windows verbietet Ordner/Dateien mit "." oder " " am Ende.
+' Entfernt diese + Bindestriche, Fallback auf strDefault wenn leer.
+Public Function RTrimSpecial(ByVal s As String, _
+                              Optional ByVal strDefault As String = "Mail") As String
+    Do While Len(s) > 0
+        Dim c As String
+        c = Right(s, 1)
+        If c = " " Or c = "." Or c = "-" Then
+            s = Left(s, Len(s) - 1)
+        Else
+            Exit Do
+        End If
+    Loop
+    If s = "" Then s = strDefault
+    RTrimSpecial = s
+End Function
+
+
+' ===========================================================================
+' MAIL-DATEINAME GENERIEREN (v0.4 - zentralisiert)
+' ===========================================================================
+
+' Erzeugt einen bereinigten Dateinamen im Format:
+'   YYYYMMDD_HHNN_Absender_Betreff.ext
+'
+' Parameter:
+'   strAbsender  - Absendername oder -email
+'   strBetreff   - Betreff der Mail (wird automatisch bereinigt)
+'   dtZeitpunkt  - Datum/Uhrzeit (EmpfangenAm oder GesendetAm)
+'   strEndung    - Dateiendung ohne Punkt (z.B. "msg")
+'   intMaxLen    - Maximale Gesamtlaenge inkl. Extension (Default 100)
+'
+' Rueckgabe: Bereinigter Dateiname mit Extension
+Public Function GeneriereMailDateiname(ByVal strAbsender As String, _
+                                       ByVal strBetreff As String, _
+                                       ByVal dtZeitpunkt As Date, _
+                                       ByVal strEndung As String, _
+                                       Optional ByVal intMaxLen As Integer = 100) As String
+    Dim strName As String
+    strName = Format(dtZeitpunkt, "yyyymmdd\_hhnn")
+
+    ' Absender kuerzen
+    Dim strAbsKurz As String
+    strAbsKurz = BereinigeDateiname(KuerzeAbsender(strAbsender), 20)
+    If strAbsKurz <> "" And strAbsKurz <> "Unbenannt" Then
+        strName = strName & "_" & strAbsKurz
+    End If
+
+    ' Betreff bereinigen und anhaengen
+    Dim strBetrKurz As String
+    strBetrKurz = BereinigeDateiname(BereinigeBetreff(strBetreff), 40)
+    If strBetrKurz <> "" And strBetrKurz <> "Unbenannt" And strBetrKurz <> "(Kein Betreff)" Then
+        strName = strName & "_" & strBetrKurz
+    End If
+
+    ' Extension anhaengen
+    If strEndung = "" Then strEndung = "bin"
+    strEndung = LCase(Replace(strEndung, ".", ""))
+
+    ' Gesamtlaenge pruefen (Reserve fuer ".ext")
+    Dim intMaxBase As Integer
+    intMaxBase = intMaxLen - Len(strEndung) - 1
+    If Len(strName) > intMaxBase Then
+        strName = Left(strName, intMaxBase)
+    End If
+    strName = RTrimSpecial(strName, "Mail")
+
+    GeneriereMailDateiname = strName & "." & strEndung
+End Function
+
+
+' ===========================================================================
+' ANHANG-DATEINAME BEREINIGEN (v0.4 - zentralisiert)
+' ===========================================================================
+
+' Bereinigt einen Anhang-Dateinamen und kuerzt bei Bedarf.
+' Erhaelt die Extension intakt.
+'
+' Parameter:
+'   strOriginalName - Originaler Dateiname des Anhangs
+'   intMaxLen       - Maximale Gesamtlaenge (Default 100)
+Public Function BereinigeAnhangName(ByVal strOriginalName As String, _
+                                     Optional ByVal intMaxLen As Integer = 100) As String
+    Dim strClean As String
+    strClean = BereinigeDateiname(strOriginalName, intMaxLen + 20)
+
+    Dim strExt As String
+    strExt = HoleEndung(strClean)
+
+    Dim strBase As String
+    strBase = EntferneEndung(strClean)
+
+    ' Kuerzen unter Beibehaltung der Extension
+    If strExt <> "" Then
+        Dim intMaxBase As Integer
+        intMaxBase = intMaxLen - Len(strExt) - 1
+        If intMaxBase < 5 Then intMaxBase = 5
+        If Len(strBase) > intMaxBase Then
+            strBase = Left(strBase, intMaxBase)
+        End If
+        strBase = RTrimSpecial(strBase, "Anhang")
+        BereinigeAnhangName = strBase & "." & strExt
+    Else
+        If Len(strClean) > intMaxLen Then
+            strClean = Left(strClean, intMaxLen)
+        End If
+        BereinigeAnhangName = RTrimSpecial(strClean, "Anhang")
+    End If
+End Function
+
+
+' ===========================================================================
+' ABLAGE-BASISPFAD BAUEN (v0.4 - zentralisiert)
+' ===========================================================================
+
+' Baut den Basispfad fuer die Mail-Ablage:
+'   <Basis>\<Projekt>\<Phase>\YYYY\MM\
+'
+' Parameter:
+'   strBasis    - Export-Basispfad (z.B. "\\Server\Share\Mails\")
+'   strProjekt  - Projektname (wird bereinigt)
+'   strPhase    - Phasenname (wird bereinigt)
+'   dtDatum     - Datum fuer Jahr/Monat-Ordner
+'
+' Rueckgabe: Pfad mit abschliessendem Backslash
+Public Function BaueAblagePfad(ByVal strBasis As String, _
+                                ByVal strProjekt As String, _
+                                ByVal strPhase As String, _
+                                ByVal dtDatum As Date) As String
+
+    BaueAblagePfad = NormalisierePfad(strBasis) & _
+                     BereinigeDateiname(strProjekt, 30) & "\" & _
+                     BereinigeDateiname(strPhase, 30) & "\" & _
+                     Format(dtDatum, "yyyy") & "\" & _
+                     Format(dtDatum, "mm") & "\"
+End Function
+
+
+' ===========================================================================
+' PFAD SICHER KUERZEN (v0.4 - MAX_PATH-Schutz)
+' ===========================================================================
+
+' Konstante: Windows MAX_PATH = 260, minus 12 Reserve fuer 8.3-Dateinamen
+Private Const MAX_PFAD_LAENGE As Long = 248
+
+' Kuerzt einen Pfad auf MAX_PATH-sichere Laenge.
+' Kuerzt den letzten Pfadbestandteil (Ordner/Dateiname).
+' Gibt gekuerzten Pfad zurueck, oder Original wenn kurz genug.
+Public Function KuerzePfadSicher(ByVal strPfad As String, _
+                                  Optional ByVal lngMaxLen As Long = 0) As String
+    If lngMaxLen <= 0 Then lngMaxLen = MAX_PFAD_LAENGE
+
+    If Len(strPfad) <= lngMaxLen Then
+        KuerzePfadSicher = strPfad
+        Exit Function
+    End If
+
+    ' Letzten Bestandteil finden und kuerzen
+    Dim lngUeber As Long
+    lngUeber = Len(strPfad) - lngMaxLen
+
+    Dim lngLastSep As Long
+    lngLastSep = InStrRev(strPfad, "\")
+    If lngLastSep > 0 And lngLastSep < Len(strPfad) Then
+        Dim strBasis As String
+        strBasis = Left(strPfad, lngLastSep)
+        Dim strLetzer As String
+        strLetzer = Mid(strPfad, lngLastSep + 1)
+
+        If Len(strLetzer) > lngUeber + 5 Then
+            strLetzer = Left(strLetzer, Len(strLetzer) - lngUeber - 5)
+            strLetzer = RTrimSpecial(strLetzer, "X")
+        End If
+
+        KuerzePfadSicher = strBasis & strLetzer
+    Else
+        ' Kein Separator: einfach abschneiden
+        KuerzePfadSicher = Left(strPfad, lngMaxLen)
+    End If
 End Function

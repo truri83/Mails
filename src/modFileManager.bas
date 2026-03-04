@@ -330,54 +330,7 @@ End Function
 ' HILFSFUNKTIONEN (privat)
 ' ===========================================================================
 
-' Absender-Name kuerzen: Teil vor @ nehmen, oder erstes Wort
-Private Function KuerzeAbsender(ByVal strAbsender As String) As String
-    If Nz(strAbsender, "") = "" Then
-        KuerzeAbsender = ""
-        Exit Function
-    End If
-
-    Dim s As String
-    s = Trim(strAbsender)
-
-    ' Wenn Email-Adresse: Teil vor @
-    Dim lngAt As Long
-    lngAt = InStr(s, "@")
-    If lngAt > 1 Then
-        s = Left(s, lngAt - 1)
-        ' Punkte durch Leerzeichen
-        s = Replace(s, ".", " ")
-    End If
-
-    ' Nur erstes+zweites Wort behalten (max 20 Zeichen)
-    Dim arrTeile As Variant
-    arrTeile = Split(Trim(s), " ")
-    If UBound(arrTeile) >= 1 Then
-        s = arrTeile(0) & " " & arrTeile(1)
-    ElseIf UBound(arrTeile) >= 0 Then
-        s = arrTeile(0)
-    End If
-
-    KuerzeAbsender = Left(s, 20)
-End Function
-
-
-' Trailing Leerzeichen, Punkte und Bindestriche entfernen
-' (Windows kann keine Ordner mit "." oder " " am Ende)
-Private Function RTrimSpecial(ByVal s As String) As String
-    Do While Len(s) > 0
-        Dim c As String
-        c = Right(s, 1)
-        If c = " " Or c = "." Or c = "-" Then
-            s = Left(s, Len(s) - 1)
-        Else
-            Exit Do
-        End If
-    Loop
-    If s = "" Then s = "Mail"
-    RTrimSpecial = s
-End Function
-
+' KuerzeAbsender und RTrimSpecial -> zentralisiert in modStringUtils (v0.4)
 
 ' Prueft ob ein VBA-Fehlercode ein Netzwerk-Problem anzeigt
 Private Function IstNetzwerkFehler(ByVal lngErrNum As Long) As Boolean
