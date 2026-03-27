@@ -1,4 +1,3 @@
-Attribute VB_Name = "modCID"
 Option Compare Database
 Option Explicit
 
@@ -70,7 +69,7 @@ Public Function ExtrahiereCIDReferenzen(ByVal strHTML As String) As Object
     Exit Function
 
 ErrHandler:
-    LogVBAError "ExtrahiereCIDReferenzen"
+    HandleError "modCID", "ExtrahiereCIDReferenzen"
     Set ExtrahiereCIDReferenzen = CreateObject("Scripting.Dictionary")
 End Function
 
@@ -149,7 +148,7 @@ NaechsterCID:
     Exit Function
 
 ErrHandler:
-    LogVBAError "MapCIDZuAnhaenge"
+    HandleError "modCID", "MapCIDZuAnhaenge"
     MapCIDZuAnhaenge = 0
 End Function
 
@@ -204,7 +203,7 @@ NaechsterLink:
     Exit Function
 
 ErrHandler:
-    LogVBAError "ErsetzeCIDLinks"
+    HandleError "modCID", "ErsetzeCIDLinks"
     ErsetzeCIDLinks = strHTML
 End Function
 
@@ -258,7 +257,7 @@ Public Function VerarbeiteCIDKomplett(ByVal strHTML As String, _
     Exit Function
 
 ErrHandler:
-    LogVBAError "VerarbeiteCIDKomplett"
+    HandleError "modCID", "VerarbeiteCIDKomplett"
     VerarbeiteCIDKomplett = strHTML
 End Function
 
@@ -308,6 +307,8 @@ Public Function BaueCIDSchluessel(ByVal strCID As String) As Object
     Exit Function
 
 ErrHandler:
-    LogVBAError "BaueCIDSchluessel"
+    HandleError "modCID", "BaueCIDSchluessel"
     Set BaueCIDSchluessel = CreateObject("Scripting.Dictionary")
 End Function
+
+

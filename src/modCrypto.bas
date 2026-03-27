@@ -1,4 +1,3 @@
-Attribute VB_Name = "modCrypto"
 Option Compare Database
 Option Explicit
 
@@ -161,3 +160,5 @@ Public Function GeneriereMailHash(ByVal strBetreff As String, _
              Format(dtEmpfangen, "yyyymmddhhnnss")
     GeneriereMailHash = SHA256_Hash(strRaw)
 End Function
+
+

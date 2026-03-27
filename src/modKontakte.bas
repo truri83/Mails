@@ -1,4 +1,3 @@
-Attribute VB_Name = "modKontakte"
 Option Compare Database
 Option Explicit
 
@@ -366,7 +365,7 @@ Public Function LerneVonDomain(ByVal strEmail As String) As Object
     Set db = CurrentDb
 
     Set rs = db.OpenRecordset( _
-        "SELECT TOP 1 Vorname, Nachname, Titel, Institution FROM tblKontakte " & _
+        "SELECT TOP 1 Vorname, Nachname, Titel, Institution FROM [" & TBL_KONTAKTE & "] " & _
         "WHERE Email LIKE '*@" & strBase & "*' " & _
         "AND Nz(Vorname,'') <> '' AND Nz(Nachname,'') <> ''", dbOpenSnapshot)
 
@@ -404,7 +403,7 @@ Public Function BrauchtEmailUpdate(ByVal lngKontaktID As Long, _
     If Left(strNeueEmail, 3) = "/O=" Then Exit Function
 
     Dim strAlt As String
-    strAlt = Nz(DLookup("Email", "tblKontakte", "KontaktID=" & lngKontaktID), "")
+    strAlt = Nz(DLookup("Email", TBL_KONTAKTE, "KontaktID=" & lngKontaktID), "")
 
     If Trim(strAlt) = "" _
        Or LCase(Trim(strAlt)) = LCase(DEFAULT_EMAIL) _
@@ -425,9 +424,9 @@ Public Sub AktualisiereKontaktEmail(ByVal lngKontaktID As Long, _
 
     If Not BrauchtEmailUpdate(lngKontaktID, strNeueEmail) Then Exit Sub
 
-    CurrentDb.Execute "UPDATE tblKontakte SET " & _
+    CurrentDb.Execute "UPDATE [" & TBL_KONTAKTE & "] SET " & _
                       "Email='" & SQLSafe(strNeueEmail) & "', " & _
-                      "AktualisiertAm=#" & Format(Now, "mm/dd/yyyy hh:nn:ss") & "# " & _
+                      "AktualisiertAm=" & SQLJetzt() & " " & _
                       "WHERE KontaktID=" & lngKontaktID, dbFailOnError
 
     LogDebug "Kontakt-Email aktualisiert: ID=" & lngKontaktID & " -> " & strNeueEmail, "KONTAKT"
@@ -436,3 +435,5 @@ Public Sub AktualisiereKontaktEmail(ByVal lngKontaktID As Long, _
 ErrHandler:
     LogWarn "Kontakt-Email-Update fehlgeschlagen: " & Err.Description, "KONTAKT"
 End Sub
+
+

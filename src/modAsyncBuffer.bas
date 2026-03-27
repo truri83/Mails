@@ -1,4 +1,3 @@
-Attribute VB_Name = "modAsyncBuffer"
 Option Compare Database
 Option Explicit
 
@@ -38,6 +37,12 @@ Option Explicit
 '                  modGlobals, modBackend, modSchema
 ' ===========================================================================
 
+' Win32 API fuer Sleep (falls nicht in anderem Modul deklariert)
+#If VBA7 Then
+    Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#Else
+    Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+#End If
 
 ' ---------------------------------------------------------------------------
 ' MODUL-VARIABLEN: Schreib-Puffer
@@ -56,6 +61,7 @@ Private m_strKontextExportBase  As String
 Private m_blnKontextAnhaenge    As Boolean
 Private m_blnKontextMSG         As Boolean
 Private m_blnKontextFilter      As Boolean
+Private m_lngKontextProjektID   As Long
 
 ' ---------------------------------------------------------------------------
 ' MODUL-VARIABLEN: Datei-Queue
@@ -87,7 +93,7 @@ Private m_lngGesamtDateien      As Long
 ' Standard-Groesse aus Config oder 50 wenn nicht konfiguriert
 Public Sub BufferInit(Optional ByVal lngMaxGroesse As Long = 0)
     If lngMaxGroesse <= 0 Then
-        lngMaxGroesse = CLng(LeseConfig("BufferGroesse", "50"))
+        lngMaxGroesse = CLng(CacheGetConfig(CFG_BUFFER_GROESSE, "50"))
     End If
     If lngMaxGroesse < 5 Then lngMaxGroesse = 5
     If lngMaxGroesse > 500 Then lngMaxGroesse = 500
@@ -121,7 +127,8 @@ Public Sub BufferSetzeKontext(ByVal lngSyncLaufID As Long, _
                                ByVal strExportBase As String, _
                                ByVal blnAnhaenge As Boolean, _
                                ByVal blnMSG As Boolean, _
-                               ByVal blnFilter As Boolean)
+                               ByVal blnFilter As Boolean, _
+                               Optional ByVal lngProjektID As Long = 0)
     m_lngKontextSyncLaufID = lngSyncLaufID
     m_lngKontextOrdnerID = lngOrdnerID
     m_strKontextProjekt = strProjekt
@@ -130,6 +137,7 @@ Public Sub BufferSetzeKontext(ByVal lngSyncLaufID As Long, _
     m_blnKontextAnhaenge = blnAnhaenge
     m_blnKontextMSG = blnMSG
     m_blnKontextFilter = blnFilter
+    m_lngKontextProjektID = lngProjektID
 End Sub
 
 
@@ -263,7 +271,7 @@ Public Function BufferFlush() As Long
 
     LogDebug "BufferFlush: " & m_lngBufferAnzahl & " Eintraege (Direct DAO)...", "BUFFER"
 
-    ' --- 0. Backend-DB Pfad ermitteln ---
+    ' --- 0. Backend-DB Pfad ermitteln + Health-Check ---
     Dim strBackendPfad As String
     strBackendPfad = GetBackendPfad()
 
@@ -271,19 +279,35 @@ Public Function BufferFlush() As Long
     Dim blnDirect As Boolean
     blnDirect = (strBackendPfad <> "" And Dir(strBackendPfad) <> "")
 
-    ' --- 1. Batch-Duplikatpruefung (Direct DAO) ---
+    ' Mid-Sync Health-Check: Sind die Linked Tables noch funktional?
+    If Not blnDirect Then
+        ' Lokal oder Backend-Datei weg: Health-Check auf Linked Tables
+        If Not BackendHealthCheck() Then
+            LogError "BufferFlush: Backend HealthCheck fehlgeschlagen - Flush abgebrochen", "BUFFER"
+            m_lngGesamtFehler = m_lngGesamtFehler + m_lngBufferAnzahl
+            m_lngBufferAnzahl = 0
+            If m_lngBufferMax > 0 Then ReDim m_aBuffer(0 To m_lngBufferMax - 1)
+            BufferFlush = 0
+            Exit Function
+        End If
+    End If
+
+    ' --- 1. Batch-Duplikatpruefung (InternetMessageID-first, Hash-fallback) ---
     Dim arrHashes() As String
+    Dim arrMsgIDs() As String
     Dim arrExistiert() As Boolean
     Dim n As Long
 
     ReDim arrHashes(0 To m_lngBufferAnzahl - 1)
+    ReDim arrMsgIDs(0 To m_lngBufferAnzahl - 1)
     ReDim arrExistiert(0 To m_lngBufferAnzahl - 1)
 
     For n = 0 To m_lngBufferAnzahl - 1
         arrHashes(n) = m_aBuffer(n).UniqueHash
+        arrMsgIDs(n) = Nz(m_aBuffer(n).Mail.InternetMessageID, "")
     Next n
 
-    Call PruefeHashesDirect(arrHashes, arrExistiert, strBackendPfad)
+    Call PruefeDuplikateDirect(arrHashes, arrMsgIDs, arrExistiert, strBackendPfad)
 
     ' --- 2. Transaktion: Nicht-Duplikate in DB schreiben ---
     ' Hinweis: DB-Schreiben laueft ueber modDAO (CurrentDb/Linked Tables)
@@ -360,7 +384,7 @@ RollbackHandler:
     Exit Function
 
 ErrHandler:
-    LogVBAError "BufferFlush"
+    HandleError "modAsyncBuffer", "BufferFlush"
     BufferFlush = 0
 End Function
 
@@ -427,10 +451,16 @@ Private Function SpeichereMailAusBuffer(ByRef mk As TypMailKomplett) As Long
                                   mk.Empfaenger(e).Email)
     Next e
 
-    ' --- Ablagestruktur: Mail-Ordner bestimmen (v0.4) ---
+    ' --- Ablagestruktur: Mail-Ordner bestimmen (v0.6: Projekt oder _Eingang) ---
     Dim strMailOrdner As String
+    Dim strProjektOrdner As String
+    If m_lngKontextProjektID > 0 Then
+        strProjektOrdner = HoleProjektOrdnerName(m_lngKontextProjektID)
+    Else
+        strProjektOrdner = "_Eingang"
+    End If
     strMailOrdner = BaueMailOrdnerPfad(m_strKontextExportBase, _
-                                        m_strKontextProjekt, _
+                                        strProjektOrdner, _
                                         m_strKontextPhase, _
                                         mk.Mail.EmpfangenAm, _
                                         mk.Mail.AbsenderName, _
@@ -463,26 +493,34 @@ Private Function SpeichereMailAusBuffer(ByRef mk As TypMailKomplett) As Long
     End If
 
     ' --- Status ---
-    Call SpeichereEmailStatus(lngEmailID, "Verarbeitet", "Sync", "Import via BufferFlush v0.4")
+    Call SpeichereEmailStatus(lngEmailID, EMAIL_STATUS_VERARBEITET, "Sync", "Import via BufferFlush v0.6")
+
+    ' --- Projekt-Zuordnung (auto, wenn Kontext ProjektID hat) ---
+    If m_lngKontextProjektID > 0 Then
+        OrdneEmailProjektZu lngEmailID, m_lngKontextProjektID, EP_QUELLE_AUTO
+    End If
 
     SpeichereMailAusBuffer = lngEmailID
     Exit Function
 
 ErrHandler:
-    LogVBAError "SpeichereMailAusBuffer [" & Left(Nz(mk.Mail.Betreff, "?"), 30) & "]"
+    HandleError "modAsyncBuffer", "SpeichereMailAusBuffer", Left(Nz(mk.Mail.Betreff, "?"), 30)
     SpeichereMailAusBuffer = 0
 End Function
 
 
 ' ===========================================================================
-' BATCH-DUPLIKATPRUEFUNG (Direct DAO, v0.4)
+' BATCH-DUPLIKATPRUEFUNG (v0.6: InternetMessageID-first, Hash-fallback)
 ' ===========================================================================
 
-' Prueft Hashes via Direct DAO auf der Backend-DB.
+' Zweistufige Duplikatpruefung via Direct DAO auf der Backend-DB.
+' Stufe 1: InternetMessageID (primaer, faengt CC-Duplikate ab)
+' Stufe 2: UniqueHash (Fallback fuer Mails ohne InternetMessageID)
 ' Bei Fehler: Fallback auf CurrentDb (Linked Tables).
-Private Sub PruefeHashesDirect(ByRef arrHashes() As String, _
-                                ByRef arrExistiert() As Boolean, _
-                                ByVal strBackendPfad As String)
+Private Sub PruefeDuplikateDirect(ByRef arrHashes() As String, _
+                                   ByRef arrMsgIDs() As String, _
+                                   ByRef arrExistiert() As Boolean, _
+                                   ByVal strBackendPfad As String)
     On Error GoTo ErrHandler
 
     Dim n As Long
@@ -491,81 +529,121 @@ Private Sub PruefeHashesDirect(ByRef arrHashes() As String, _
 
     ' Kein Backend oder leer: Fallback auf Linked
     If strBackendPfad = "" Or Dir(strBackendPfad) = "" Then
-        Call PruefeHashesLinked(arrHashes, arrExistiert)
+        Call PruefeDuplikateLinked(arrHashes, arrMsgIDs, arrExistiert)
         Exit Sub
     End If
-
-    ' Fuer kleine Batches: einzelne Pruefung via Direct DAO
-    If lngAnzahl <= 5 Then
-        Dim dbDir As DAO.Database
-        Set dbDir = DBEngine.Workspaces(0).OpenDatabase(strBackendPfad)
-        Dim rsDir As DAO.Recordset
-        For n = 0 To lngAnzahl - 1
-            Set rsDir = dbDir.OpenRecordset( _
-                "SELECT Count(*) FROM tblEmails WHERE UniqueHash='" & _
-                SQLSafe(arrHashes(n)) & "'", dbOpenSnapshot)
-            arrExistiert(n) = (Nz(rsDir(0), 0) > 0)
-            rsDir.Close: Set rsDir = Nothing
-        Next n
-        dbDir.Close: Set dbDir = Nothing
-        Exit Sub
-    End If
-
-    ' Fuer groessere Batches: IN-Query via Direct DAO
-    Dim strIN As String
-    strIN = ""
-    For n = 0 To lngAnzahl - 1
-        If strIN <> "" Then strIN = strIN & ","
-        strIN = strIN & "'" & SQLSafe(arrHashes(n)) & "'"
-    Next n
-
-    Dim dict As Object
-    Set dict = CreateObject("Scripting.Dictionary")
 
     Dim dbDirect As DAO.Database
     Set dbDirect = DBEngine.Workspaces(0).OpenDatabase(strBackendPfad)
-    Dim rs As DAO.Recordset
-    Set rs = dbDirect.OpenRecordset( _
-        "SELECT UniqueHash FROM tblEmails WHERE UniqueHash IN (" & strIN & ")", _
-        dbOpenSnapshot)
 
-    Do While Not rs.EOF
-        dict(CStr(rs!UniqueHash)) = True
-        rs.MoveNext
-    Loop
-    rs.Close: Set rs = Nothing
-    dbDirect.Close: Set dbDirect = Nothing
+    ' --- Stufe 1: InternetMessageID-Pruefung ---
+    Dim strMsgIDIN As String
+    strMsgIDIN = ""
+    Dim lngMsgIDCount As Long: lngMsgIDCount = 0
 
     For n = 0 To lngAnzahl - 1
-        arrExistiert(n) = dict.Exists(arrHashes(n))
+        If arrMsgIDs(n) <> "" Then
+            If strMsgIDIN <> "" Then strMsgIDIN = strMsgIDIN & ","
+            strMsgIDIN = strMsgIDIN & "'" & SQLSafe(arrMsgIDs(n)) & "'"
+            lngMsgIDCount = lngMsgIDCount + 1
+        End If
     Next n
 
-    Set dict = Nothing
+    If lngMsgIDCount > 0 Then
+        Dim dictMsgID As Object
+        Set dictMsgID = CreateObject("Scripting.Dictionary")
+
+        Dim rsMsgID As DAO.Recordset
+        Set rsMsgID = dbDirect.OpenRecordset( _
+            "SELECT InternetMessageID FROM [" & TBL_EMAILS & "] " & _
+            "WHERE InternetMessageID IN (" & strMsgIDIN & ")", dbOpenSnapshot)
+
+        Do While Not rsMsgID.EOF
+            dictMsgID(CStr(Nz(rsMsgID!InternetMessageID, ""))) = True
+            rsMsgID.MoveNext
+        Loop
+        rsMsgID.Close: Set rsMsgID = Nothing
+
+        For n = 0 To lngAnzahl - 1
+            If arrMsgIDs(n) <> "" Then
+                arrExistiert(n) = dictMsgID.Exists(arrMsgIDs(n))
+            End If
+        Next n
+
+        Set dictMsgID = Nothing
+    End If
+
+    ' --- Stufe 2: Hash-Pruefung (nur fuer noch nicht als Duplikat erkannte) ---
+    Dim strHashIN As String
+    strHashIN = ""
+    Dim lngHashCount As Long: lngHashCount = 0
+
+    For n = 0 To lngAnzahl - 1
+        If Not arrExistiert(n) Then
+            If strHashIN <> "" Then strHashIN = strHashIN & ","
+            strHashIN = strHashIN & "'" & SQLSafe(arrHashes(n)) & "'"
+            lngHashCount = lngHashCount + 1
+        End If
+    Next n
+
+    If lngHashCount > 0 Then
+        Dim dictHash As Object
+        Set dictHash = CreateObject("Scripting.Dictionary")
+
+        Dim rsHash As DAO.Recordset
+        Set rsHash = dbDirect.OpenRecordset( _
+            "SELECT UniqueHash FROM [" & TBL_EMAILS & "] " & _
+            "WHERE UniqueHash IN (" & strHashIN & ")", dbOpenSnapshot)
+
+        Do While Not rsHash.EOF
+            dictHash(CStr(rsHash!UniqueHash)) = True
+            rsHash.MoveNext
+        Loop
+        rsHash.Close: Set rsHash = Nothing
+
+        For n = 0 To lngAnzahl - 1
+            If Not arrExistiert(n) Then
+                arrExistiert(n) = dictHash.Exists(arrHashes(n))
+            End If
+        Next n
+
+        Set dictHash = Nothing
+    End If
+
+    dbDirect.Close: Set dbDirect = Nothing
     Exit Sub
 
 ErrHandler:
     ' Fallback auf Linked Tables (CurrentDb)
-    LogWarn "Direct-DAO Hash-Pruefung fehlgeschlagen, Fallback auf Linked: " & _
+    LogWarn "Direct-DAO Duplikatpruefung fehlgeschlagen, Fallback auf Linked: " & _
             Err.Description, "BUFFER"
     On Error Resume Next
-    Call PruefeHashesLinked(arrHashes, arrExistiert)
+    Call PruefeDuplikateLinked(arrHashes, arrMsgIDs, arrExistiert)
     On Error GoTo 0
 End Sub
 
 
-' Fallback: Hash-Pruefung ueber Linked Tables (CurrentDb)
-Private Sub PruefeHashesLinked(ByRef arrHashes() As String, _
-                                ByRef arrExistiert() As Boolean)
+' Fallback: Duplikatpruefung ueber Linked Tables (CurrentDb)
+Private Sub PruefeDuplikateLinked(ByRef arrHashes() As String, _
+                                   ByRef arrMsgIDs() As String, _
+                                   ByRef arrExistiert() As Boolean)
     On Error GoTo ErrHandler
 
     Dim n As Long
     For n = 0 To UBound(arrHashes)
+        ' Stufe 1: InternetMessageID
+        If arrMsgIDs(n) <> "" Then
+            arrExistiert(n) = ExistiertInternetMessageID(arrMsgIDs(n))
+            If arrExistiert(n) Then GoTo NaechsterEintrag
+        End If
+        ' Stufe 2: Hash
         arrExistiert(n) = ExistiertMailHash(arrHashes(n))
+NaechsterEintrag:
     Next n
     Exit Sub
 
 ErrHandler:
-    LogWarn "Linked Hash-Pruefung fehlgeschlagen: " & Err.Description, "BUFFER"
+    LogWarn "Linked Duplikatpruefung fehlgeschlagen: " & Err.Description, "BUFFER"
     On Error Resume Next
     For n = 0 To UBound(arrHashes)
         arrExistiert(n) = False
@@ -614,23 +692,32 @@ Public Function DateiQueueVerarbeiten() As Long
     Dim lngOK As Long, lngFail As Long
     Dim intMaxRetries As Integer
     lngOK = 0: lngFail = 0
-    intMaxRetries = CInt(LeseConfig("NetzwerkRetries", "3"))
+    intMaxRetries = CInt(CacheGetConfig(CFG_NETZWERK_RETRIES, "3"))
 
     Dim lngBasisPause As Long
-    lngBasisPause = CLng(LeseConfig("NetzwerkRetryPause", "2000"))
+    lngBasisPause = CLng(CacheGetConfig(CFG_NETZWERK_PAUSE, "2000"))
+
+    Dim lngNetzwerkTimeout As Long
+    lngNetzwerkTimeout = CLng(CacheGetConfig(CFG_NETZWERK_TIMEOUT, "30"))
+    If lngNetzwerkTimeout < 5 Then lngNetzwerkTimeout = 5
+    If lngNetzwerkTimeout > 600 Then lngNetzwerkTimeout = 600
 
     LogDebug "DateiQueue: " & m_lngDateiQueueAnzahl & " Dateien verarbeiten...", "BUFFER"
 
     ' Netzwerk-Pruefung vor dem Start
     If m_strKontextExportBase <> "" Then
-        If Not IstNetzwerkOK(m_strKontextExportBase) Then
-            LogWarn "Netzwerk nicht erreichbar vor DateiQueue - warte...", "BUFFER"
-            If Not WarteAufNetzwerk(m_strKontextExportBase) Then
-                LogError "Netzwerk-Timeout - DateiQueue NICHT verarbeitet. " & _
-                         m_lngDateiQueueAnzahl & " Dateien verbleiben im Temp.", "BUFFER"
-                DateiQueueVerarbeiten = 0
-                Exit Function
+        If IstNetzwerkPfad(m_strKontextExportBase) Then
+            If Not IstNetzwerkOK(m_strKontextExportBase) Then
+                LogWarn "Netzwerk nicht erreichbar vor DateiQueue - warte...", "BUFFER"
+                If Not WarteAufNetzwerk(m_strKontextExportBase, lngNetzwerkTimeout) Then
+                    LogError "Netzwerk-Timeout - DateiQueue NICHT verarbeitet. " & _
+                             m_lngDateiQueueAnzahl & " Dateien verbleiben im Temp.", "BUFFER"
+                    DateiQueueVerarbeiten = 0
+                    Exit Function
+                End If
             End If
+        Else
+            ErstelleOrdner m_strKontextExportBase
         End If
     End If
 
@@ -644,7 +731,7 @@ Public Function DateiQueueVerarbeiten() As Long
 
         If KopiereNachNetzwerk(m_aDateiQueue(n).QuellPfad, _
                                 m_aDateiQueue(n).ZielPfad, _
-                                intMaxRetries, lngBasisPause) Then
+                                intMaxRetries, lngBasisPause, lngNetzwerkTimeout) Then
             ' Erfolg: DB-Pfad aktualisieren
             Select Case m_aDateiQueue(n).OperationsTyp
                 Case "MSG"
@@ -685,7 +772,7 @@ Public Function DateiQueueVerarbeiten() As Long
     Exit Function
 
 ErrHandler:
-    LogVBAError "DateiQueueVerarbeiten"
+    HandleError "modAsyncBuffer", "DateiQueueVerarbeiten"
     DateiQueueVerarbeiten = 0
 End Function
 
@@ -739,9 +826,5 @@ Private Sub LoescheTempDateien(ByRef mk As TypMailKomplett)
     On Error GoTo 0
 End Sub
 
-' Win32 API fuer Sleep (falls nicht in anderem Modul deklariert)
-#If VBA7 Then
-    Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-#Else
-    Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-#End If
+
+

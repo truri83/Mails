@@ -1,4 +1,3 @@
-Attribute VB_Name = "modTransactionManager"
 Option Compare Database
 Option Explicit
 
@@ -12,7 +11,7 @@ Option Explicit
 '
 ' FEATURES:
 '   - Logically Flattened Transactions (Tiefenzaehler)
-'   - Doom-Flag: Inner Rollback → aeusserer Rollback
+'   - Doom-Flag: Inner Rollback ? aeusserer Rollback
 '   - ForceCleanup: Loop-basierter Rollback bis Error 3034
 '   - Auto-Recovery nach kritischen Fehlern
 '   - Safe SQL Execution mit Retry-Logik
@@ -41,22 +40,12 @@ Private Const MODUL_NAME As String = "modTransactionManager"
 
 
 ' ---------------------------------------------------------------------------
-' API DEKLARATIONEN
-' ---------------------------------------------------------------------------
-#If VBA7 Then
-    Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-#Else
-    Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
-#End If
-
-
-' ---------------------------------------------------------------------------
 ' MODUL-VARIABLEN
 ' ---------------------------------------------------------------------------
 
 ' Transaktions-Status
 Private m_iTransDepth       As Integer      ' Verschachtelungstiefe (logisch, nicht physisch)
-Private m_bTransactionDoomed As Boolean     ' Doom-Flag: Inner Rollback → Global Rollback
+Private m_bTransactionDoomed As Boolean     ' Doom-Flag: Inner Rollback ? Global Rollback
 Private m_bRecoveryMode     As Boolean      ' Recovery laeuft gerade
 Private m_dbCurrent         As DAO.Database ' Singleton DB-Referenz
 
@@ -300,7 +289,7 @@ Public Function CheckAndRecover() As Boolean
     ' Kurze Pause fuer DB-Stabilisierung
     Sleep 500
 
-    ' Test ob DB wieder verfuegbar (Flag ist jetzt False → keine Rekursion)
+    ' Test ob DB wieder verfuegbar (Flag ist jetzt False ? keine Rekursion)
     Dim db As DAO.Database
     Set db = GetSafeDB()
     If db Is Nothing Then
@@ -384,6 +373,17 @@ Private Sub ExecuteWithRetryAndFeedback(ByVal sSQL As String, _
 
         lastError = Err.Description
 
+        ' Netzwerkfehler -> sofort abbrechen, KEIN Retry, KEIN User-Dialog!
+        If IstNetzwerkFehler(Err.Number) Then
+            Dim lngNetzErr As Long
+            lngNetzErr = Err.Number
+            g_blnBackendOffline = True
+            On Error GoTo 0
+            LogError "[TransMgr] Netzwerkfehler bei SQL: " & Left(sSQL, 100), "NETZWERK"
+            Err.Raise lngNetzErr, "ExecuteActionQuery", _
+                "Netzwerkfehler: " & lastError
+        End If
+
         ' Nur bei Lock-Fehlern Retry sinnvoll
         If Not IsLockError(Err.Number) Then
             On Error GoTo 0
@@ -444,6 +444,19 @@ Private Sub ExecuteWithRetrySimple(ByVal sSQL As String, _
 
         If Err.Number = 0 Then Exit Sub
 
+        ' Netzwerkfehler -> sofort abbrechen, KEIN Retry!
+        If IstNetzwerkFehler(Err.Number) Then
+            Dim lngNetzErr As Long
+            lngNetzErr = Err.Number
+            Dim sNetzDesc As String
+            sNetzDesc = Err.Description
+            g_blnBackendOffline = True
+            On Error GoTo 0
+            LogError "[TransMgr] Netzwerkfehler bei SQL: " & Left(sSQL, 100), "NETZWERK"
+            Err.Raise lngNetzErr, "ExecuteActionQuery", _
+                "Netzwerkfehler: " & sNetzDesc
+        End If
+
         If Not IsLockError(Err.Number) Then
             On Error GoTo 0
             Err.Raise Err.Number, "ExecuteActionQuery", _
@@ -475,6 +488,7 @@ End Sub
 ' Prueft ob ein Fehler ein Lock-/Sperr-Problem ist (retry-faehig)
 Public Function IsLockError(ByVal errNum As Long) As Boolean
     Select Case errNum
+        Case 3045  ' Datei konnte nicht verwendet werden / wird bereits verwendet
         Case 3188  ' Aktualisierung nicht moeglich (gesperrt)
         Case 3197  ' Daten wurden von anderem Benutzer geaendert
         Case 3211  ' Datenbank kann nicht gesperrt werden
@@ -646,3 +660,5 @@ ErrHandler:
     On Error Resume Next: If Not rs Is Nothing Then rs.Close: On Error GoTo 0
     GetScalarString = ""
 End Function
+
+

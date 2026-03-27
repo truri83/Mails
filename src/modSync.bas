@@ -1,4 +1,3 @@
-Attribute VB_Name = "modSync"
 Option Compare Database
 Option Explicit
 
@@ -6,7 +5,7 @@ Option Explicit
 ' modSync - Synchronisations-Orchestrierung
 ' ===========================================================================
 ' Hauptmodul fuer die Outlook-zu-Access-Synchronisation.
-' v0.4: Extract-Release-Process mit Direct DAO + Netzwerk-Resilienz.
+' v0.4.3: COM-Resilienz + Throttling + Notbremse
 '
 ' Architektur:
 '   1. EXTRACT: Alle Daten aus RDO-Objekt lesen (modMailExtract)
@@ -14,6 +13,13 @@ Option Explicit
 '   3. BUFFER:  In Speicher-Puffer sammeln (modAsyncBuffer)
 '   4. FLUSH:   Batch in DB schreiben (Direct DAO, 1 Transaktion)
 '   5. COPY:    Dateien Temp->Netzwerk (modFileManager, Retry+Recovery)
+'
+' COM-Resilienz (v0.4.3):
+'   - Fehlerklassifikation pro Mail (TRANSIENT/FATAL/ITEM)
+'   - Throttling: 10ms Pause alle 10 Mails (Outlook-Messagepump)
+'   - Notbremse: 10 aufeinanderfolgende Fehler -> Abbruch
+'   - FATAL-Erkennung: Ordner-Referenz verloren -> sauberes Ende
+'   - Statistik: COM-Retries + Reconnects im Ergebnis
 '
 ' Neu in v0.4:
 '   - Direct DAO fuer Hash-Lookup (9.3x schneller)
@@ -60,7 +66,7 @@ Public Sub SyncPosteingang(Optional ByVal strProjekt As String = "Standard", _
 
     ' Maximale Mailanzahl aus Config lesen wenn nicht angegeben
     If lngMaxMails <= 0 Then
-        lngMaxMails = CLng(LeseConfig("MaxMailsProSync", "500"))
+        lngMaxMails = CLng(CacheGetConfig(CFG_MAX_MAILS, "500"))
     End If
 
     Call SyncFolder(objInbox, strProjekt, strPhase, lngMaxMails, blnSubfolder)
@@ -87,7 +93,7 @@ Public Sub SyncOrdner(ByVal strOrdnerPfad As String, _
     End If
 
     If lngMaxMails <= 0 Then
-        lngMaxMails = CLng(LeseConfig("MaxMailsProSync", "500"))
+        lngMaxMails = CLng(CacheGetConfig(CFG_MAX_MAILS, "500"))
     End If
 
     Call SyncFolder(objFolder, strProjekt, strPhase, lngMaxMails, blnSubfolder)
@@ -128,17 +134,36 @@ Public Sub SyncFolder(objFolder As Object, _
     Dim objItem         As Object
     Dim i               As Long
     Dim mk              As TypMailKomplett
+    Dim dblHeartbeatLast As Double
+    Const HEARTBEAT_S As Double = 5#
+
+    ' Performance-Profiling (zur Bottleneck-Analyse)
+    Dim dblT0              As Double
+    Dim dblFetchItemsS     As Double
+    Dim dblMsgClassS       As Double
+    Dim dblExtractS        As Double
+    Dim dblBufferAddS      As Double
+    Dim dblFlushS          As Double
+    Dim dblFinalFlushS     As Double
+    Dim dblDateiQueueS     As Double
+    Dim dblBeendeSyncS     As Double
+    Dim dblCleanupS        As Double
+    Dim lngFlushCount      As Long
 
     ' --- Initialisierung ---
     InitGlobals
     g_blnAbbrechen = False
     g_dtSyncStart = Timer
+    TimerStart "SyncFolder"
 
     If Nz(strProjekt, "") = "" Then strProjekt = "Standard"
     If Nz(strPhase, "") = "" Then strPhase = "Standard"
 
+    Debug.Print "[SYNC] Zaehle Elemente in Ordner..."
     lngGesamt = objFolder.Items.Count
+    Debug.Print "[SYNC] Elemente gezaehlt: " & lngGesamt
     lngMailCount = 0: lngFehler = 0
+    dblHeartbeatLast = Timer
 
     Debug.Print String(70, "=")
     Debug.Print "=== SYNC START: " & objFolder.Name & " ==="
@@ -151,6 +176,9 @@ Public Sub SyncFolder(objFolder As Object, _
     Debug.Print "    Backend    : " & BackendStatus()
     Debug.Print "    " & Now()
     Debug.Print String(70, "=")
+
+    ' Effektive Speicherorte transparent ausgeben (Temp/Export/Backend/WorkerDB).
+    DevPfadDiagnose "SyncFolder Start", False
 
     ' Backend-Verfuegbarkeit pruefen (mit Netzwerk-Recovery)
     If Not IstBackendVerfuegbar() Then
@@ -166,33 +194,55 @@ Public Sub SyncFolder(objFolder As Object, _
         End If
     End If
 
+    Debug.Print "[SYNC] Starte Sync-Lauf..."
     ' Sync-Lauf in DB starten
     lngSyncLaufID = StarteSyncLauf(objFolder.FolderPath, strProjekt, strPhase)
 
+    Debug.Print "[SYNC] Registriere Ordner in DB..."
     ' Ordner in DB registrieren
     lngOrdnerID = SpeichereOrdner(objFolder.Name, objFolder.FolderPath, 0, "", lngGesamt)
 
-    ' Config-Flags lesen
+    ' Crash-Recovery: Sync-Zustand lokal markieren (ueberlebt Netzwerkverlust/Crash)
+    SyncZustandMarkieren lngSyncLaufID, objFolder.FolderPath
+
+    ' Config-Flags lesen (ueber Cache fuer Performance)
     Dim blnAnhaenge As Boolean
     Dim blnMSG      As Boolean
     Dim blnFilter   As Boolean
-    blnAnhaenge = (LeseConfig("AnhaengeExtrahieren", "1") = "1")
-    blnMSG = (LeseConfig("MSGExportieren", "1") = "1")
-    blnFilter = (LeseConfig("SignaturBilderFiltern", "1") = "1")
+    blnAnhaenge = (CacheGetConfig(CFG_ANHAENGE, "1") = "1")
+    blnMSG = (CacheGetConfig(CFG_MSG_EXPORT, "1") = "1")
+    blnFilter = (CacheGetConfig(CFG_SIGNATUR_FILTER, "1") = "1")
 
     ' Export-Basispfad
     Dim strExportBase As String
-    strExportBase = NormalisierePfad(LeseConfig("ExportBasisPfad", _
-                    Environ("USERPROFILE") & "\OutlookSync\"))
+    strExportBase = NormalisierePfad(CacheGetConfig(CFG_EXPORT_PFAD, _
+                    Environ("USERPROFILE") & PATH_DEFAULT_FALLBACK))
 
+    ' Projekt-Aufloesung: Name -> ProjektID (v0.6)
+    Dim lngProjektID As Long: lngProjektID = 0
+    If strProjekt <> "" Then
+        lngProjektID = GetOderErstelleProjekt(strProjekt)
+    End If
+
+    Debug.Print "[SYNC] Initialisiere Buffer/Config..."
     ' --- BUFFER INITIALISIEREN ---
     BufferInit
     BufferSetzeKontext lngSyncLaufID, lngOrdnerID, strProjekt, strPhase, _
-                       strExportBase, blnAnhaenge, blnMSG, blnFilter
+                       strExportBase, blnAnhaenge, blnMSG, blnFilter, lngProjektID
     ResetTempZaehler
+    ResetCOMStatistik
 
     ' --- EXTRACT-RELEASE-BUFFER SCHLEIFE ---
+    Dim lngConsecutiveErrors As Long: lngConsecutiveErrors = 0
+    Const MAX_CONSECUTIVE_ERRORS As Long = 10  ' Notbremse: 10 Fehler hintereinander -> Abbruch
+
     For i = 1 To lngGesamt
+
+        ' Dual-Access Worker: aktives Stop-Signal in globalen Sync-Abbruch ueberfuehren.
+        If WorkerAktiverStopAngefordert() Then
+            g_blnAbbrechen = True
+            LogWarn "SyncFolder: Worker-Stop-Signal erkannt - Sync wird sauber beendet", "SYNC"
+        End If
 
         ' Abbruch-Pruefung
         If g_blnAbbrechen Then
@@ -200,19 +250,101 @@ Public Sub SyncFolder(objFolder As Object, _
             Exit For
         End If
 
-        ' EXTRACT: Mail-Objekt holen
+        ' Throttling: alle 10 Mails kurze Atempause fuer Outlook
+        If i Mod 10 = 0 Then
+            DoEvents
+            Sleep 10  ' 10ms Pause - Outlook-Messagepump kann arbeiten
+        End If
+
+        ' Heartbeat: zyklisch Laufstatus in Direktfenster ausgeben
+        If SekundenDiff(dblHeartbeatLast, Timer) >= HEARTBEAT_S Then
+            Debug.Print "  [HB] i=" & i & "/" & lngGesamt & _
+                        " | ok=" & lngMailCount & _
+                        " | err=" & lngFehler & _
+                        " | retry=" & COMRetryZaehler() & _
+                        " | rec=" & COMReconnectZaehler() & _
+                        " | backendOff=" & IIf(g_blnBackendOffline, "1", "0")
+            dblHeartbeatLast = Timer
+        End If
+
+        ' Crash-Recovery: Position alle 25 Mails lokal speichern
+        If i Mod 25 = 0 Then
+            SyncZustandAktualisieren i
+        End If
+
+        ' Netzwerk-Schutz: Periodisch pruefen ob Backend noch da
+        If g_blnBackendOffline Then
+            LogError "SyncFolder: Backend offline (Watchdog) - Sync pausiert", "SYNC"
+            If Not PruefeBackendVorZugriff() Then
+                LogError "SyncFolder: Backend-Reconnect fehlgeschlagen - Sync endet bei Mail " & i, "SYNC"
+                SyncZustandAktualisieren i
+                Exit For
+            End If
+        End If
+
+        ' EXTRACT: Mail-Objekt holen (mit COM-Resilienz)
+        dblT0 = Timer
         On Error Resume Next
         Set objItem = objFolder.Items(i)
+        dblFetchItemsS = dblFetchItemsS + SekundenDiff(dblT0, Timer)
         If Err.Number <> 0 Or objItem Is Nothing Then
+            Dim lngItemErr As Long: lngItemErr = Err.Number
             Err.Clear
-            lngFehler = lngFehler + 1
             On Error GoTo ErrHandler
+
+            ' Fehlerklassifikation: Outlook tot oder nur Item kaputt?
+            Dim strItemKlasse As String
+            strItemKlasse = KlassifiziereCOMFehler(lngItemErr)
+
+            If strItemKlasse = "FATAL" Then
+                ' Outlook ist weg -> Warten/Reconnect
+                LogWarn "COM-Fatal bei Items(" & i & ") -> Warte auf Outlook", "SYNC"
+                If WarteAufOutlook() Then
+                    ' Ordner-Referenz ist nach Reconnect ungueltig!
+                    LogError "Ordner-Referenz verloren nach Reconnect - Sync endet", "SYNC"
+                    Exit For
+                Else
+                    LogError "Outlook nicht wiederherstellbar - Sync endet", "SYNC"
+                    Exit For
+                End If
+            End If
+
+            ' ITEM-Fehler: Mail ueberspring, Zaehler erhoehen
+            lngFehler = lngFehler + 1
+            lngConsecutiveErrors = lngConsecutiveErrors + 1
+
+            ' Notbremse: Zu viele Fehler hintereinander?
+            If lngConsecutiveErrors >= MAX_CONSECUTIVE_ERRORS Then
+                LogError "Notbremse: " & MAX_CONSECUTIVE_ERRORS & _
+                         " aufeinanderfolgende Fehler - Sync endet", "SYNC"
+                Exit For
+            End If
+
             GoTo NaechsteMail
         End If
         On Error GoTo ErrHandler
 
+        ' Erfolg: Consecutive-Error-Zaehler zuruecksetzen
+        lngConsecutiveErrors = 0
+
         ' Nur echte E-Mails (IPM.Note)
-        If Left(objItem.MessageClass, 8) <> "IPM.Note" Then GoTo NaechsteMail
+        dblT0 = Timer
+        On Error Resume Next
+        Dim strMsgClass As String
+        strMsgClass = objItem.MessageClass
+        dblMsgClassS = dblMsgClassS + SekundenDiff(dblT0, Timer)
+        If Err.Number <> 0 Then
+            Err.Clear
+            On Error GoTo ErrHandler
+            Set objItem = Nothing
+            GoTo NaechsteMail
+        End If
+        On Error GoTo ErrHandler
+
+        If Left(strMsgClass, 8) <> "IPM.Note" Then
+            Set objItem = Nothing
+            GoTo NaechsteMail
+        End If
 
         lngMailCount = lngMailCount + 1
 
@@ -223,7 +355,9 @@ Public Sub SyncFolder(objFolder As Object, _
         End If
 
         ' EXTRACT: Alle Daten aus COM-Objekt lesen
+        dblT0 = Timer
         ExtrahiereKomplett objItem, mk, blnAnhaenge, blnMSG, blnFilter
+        dblExtractS = dblExtractS + SekundenDiff(dblT0, Timer)
 
         ' RELEASE: COM-Objekt sofort freigeben (Outlook entlasten!)
         Set objItem = Nothing
@@ -235,11 +369,17 @@ Public Sub SyncFolder(objFolder As Object, _
         End If
 
         ' BUFFER: In Schreib-Puffer aufnehmen
+        dblT0 = Timer
         BufferHinzufuegen mk
+        dblBufferAddS = dblBufferAddS + SekundenDiff(dblT0, Timer)
 
         ' FLUSH: Wenn Puffer voll, Batch in DB schreiben (Transaktion)
         If BufferIstVoll() Then
+            dblT0 = Timer
+            Debug.Print "  [FLUSH] Buffer voll bei Mail " & lngMailCount & " -> schreibe Batch..."
             BufferFlush
+            dblFlushS = dblFlushS + SekundenDiff(dblT0, Timer)
+            lngFlushCount = lngFlushCount + 1
             DoEvents  ' UI responsiv halten
         End If
 
@@ -253,11 +393,19 @@ NaechsteMail:
     Next i
 
     ' --- FINALER FLUSH (restliche Daten im Puffer) ---
+    If WorkerAktiverStopAngefordert() Then g_blnAbbrechen = True
+
+    dblT0 = Timer
+    Debug.Print "[SYNC] Finaler BufferFlush..."
     BufferFlush
+    dblFinalFlushS = SekundenDiff(dblT0, Timer)
 
     ' --- DATEI-QUEUE VERARBEITEN (Temp -> Netzwerk/Festplatte) ---
     Dim lngDateien As Long
+    dblT0 = Timer
+    Debug.Print "[SYNC] Verarbeite Datei-Queue..."
     lngDateien = DateiQueueVerarbeiten()
+    dblDateiQueueS = SekundenDiff(dblT0, Timer)
 
     ' --- ERGEBNIS SAMMELN (VOR BufferLeeren!) ---
     Dim lngNeu As Long
@@ -275,11 +423,20 @@ NaechsteMail:
         strStatus = "Abgeschlossen"
     End If
 
+    dblT0 = Timer
+    Debug.Print "[SYNC] Beende Sync-Lauf in DB..."
     Call BeendeSyncLauf(lngSyncLaufID, strStatus, lngVerarbeitet, lngNeu, lngDuplikate, lngFehler)
+    dblBeendeSyncS = SekundenDiff(dblT0, Timer)
 
     ' --- AUFRAEUMEN ---
+    dblT0 = Timer
+    Debug.Print "[SYNC] Cleanup Temp/Buffer..."
     BereinigeTempDateien
     BufferLeeren
+
+    ' Crash-Recovery: Sync sauber beendet -> Zustand loeschen
+    SyncZustandLoeschen
+    dblCleanupS = SekundenDiff(dblT0, Timer)
 
     Debug.Print String(70, "-")
     Debug.Print "=== SYNC ERGEBNIS (v0.4) ==="
@@ -289,7 +446,24 @@ NaechsteMail:
     Debug.Print "  Fehler      : " & lngFehler
     Debug.Print "  Dateien     : " & lngDateien & " (" & BufferGesamtDateien() & " kumuliert)"
     Debug.Print "  Dauer       : " & Format((Timer - g_dtSyncStart) / 60, "0.0") & " min"
+    Debug.Print "  COM-Retries : " & COMRetryZaehler() & " | Reconnects: " & COMReconnectZaehler()
+    Debug.Print "  --- Performance (Sekunden) ---"
+    Debug.Print "  Fetch Items : " & Format(dblFetchItemsS, "0.000")
+    Debug.Print "  MsgClass    : " & Format(dblMsgClassS, "0.000")
+    Debug.Print "  Extraktion  : " & Format(dblExtractS, "0.000")
+    Debug.Print "  BufferAdd   : " & Format(dblBufferAddS, "0.000")
+    Debug.Print "  Flush(Loop) : " & Format(dblFlushS, "0.000") & " (" & lngFlushCount & "x)"
+    Debug.Print "  Flush(Final): " & Format(dblFinalFlushS, "0.000")
+    Debug.Print "  DateiQueue  : " & Format(dblDateiQueueS, "0.000")
+    Debug.Print "  SyncEnde DB : " & Format(dblBeendeSyncS, "0.000")
+    Debug.Print "  Cleanup     : " & Format(dblCleanupS, "0.000")
+    If lngMailCount > 0 Then
+        Debug.Print "  Extrakt/Mail: " & Format((dblExtractS / lngMailCount) * 1000, "0.0") & " ms"
+        Debug.Print "  Fetch/Mail  : " & Format((dblFetchItemsS / lngMailCount) * 1000, "0.0") & " ms"
+    End If
     Debug.Print "  Status      : " & strStatus
+    TimerStop "SyncFolder"
+    CacheStatus
     Debug.Print String(70, "=")
 
     ' --- Subfolder rekursiv verarbeiten ---
@@ -301,13 +475,25 @@ NaechsteMail:
     Exit Sub
 
 ErrHandler:
-    LogVBAError "SyncFolder"
+    HandleError "modSync", "SyncFolder"
     If lngSyncLaufID > 0 Then
         Call BeendeSyncLauf(lngSyncLaufID, "Fehler", 0, 0, 0, lngFehler + 1)
     End If
+    SyncZustandLoeschen
+    Set objItem = Nothing
     BufferLeeren
     BereinigeTempDateien
 End Sub
+
+
+' Liefert vergangene Sekunden robust auch ueber Mitternacht (Timer-Reset).
+Private Function SekundenDiff(ByVal dblStart As Double, ByVal dblEnd As Double) As Double
+    If dblEnd >= dblStart Then
+        SekundenDiff = dblEnd - dblStart
+    Else
+        SekundenDiff = (86400# - dblStart) + dblEnd
+    End If
+End Function
 
 
 ' ===========================================================================
@@ -349,15 +535,22 @@ Public Sub SyncOrdnerStruktur(Optional ByVal intMaxTiefe As Integer = 5)
 
         Call SyncOrdnerRekursiv(objRoot, lngRootID, objStore.DisplayName, _
                                  strStoreID, 1, intMaxTiefe)
+
+        Set objRoot = Nothing
+        Set objStore = Nothing
     Next objStore
 
     Debug.Print String(70, "=")
     Debug.Print "=== Ordnerstruktur eingelesen ==="
     Debug.Print String(70, "=")
+    Set objRoot = Nothing
+    Set objStore = Nothing
     Exit Sub
 
 ErrHandler:
-    LogVBAError "SyncOrdnerStruktur"
+    HandleError "modSync", "SyncOrdnerStruktur"
+    Set objRoot = Nothing
+    Set objStore = Nothing
 End Sub
 
 ' Rekursiver Ordner-Scan (v0.3: StoreID-Parameter)
@@ -386,7 +579,10 @@ Private Sub SyncOrdnerRekursiv(objParent As Object, _
             Call SyncOrdnerRekursiv(objSub, lngID, strPostfach, strStoreID, _
                                     intLevel + 1, intMaxDepth)
         End If
+
+        Set objSub = Nothing
     Next objSub
+    Set objSub = Nothing
     On Error GoTo 0
 End Sub
 
@@ -430,8 +626,10 @@ Private Sub SyncSubfolder(objParent As Object, _
         End If
 
 NaechsterSub:
+        Set objSub = Nothing
     Next objSub
 
+    Set objSub = Nothing
     On Error GoTo 0
 End Sub
 
@@ -455,7 +653,7 @@ Public Sub SyncPostfach(ByVal strPostfachName As String, _
     End If
 
     If lngMaxMailsProOrdner <= 0 Then
-        lngMaxMailsProOrdner = CLng(LeseConfig("MaxMailsProSync", "500"))
+        lngMaxMailsProOrdner = CLng(CacheGetConfig(CFG_MAX_MAILS, "500"))
     End If
 
     ' Store finden
@@ -497,10 +695,13 @@ Public Sub SyncPostfach(ByVal strPostfachName As String, _
     Debug.Print String(70, "=")
 
     Set objRoot = Nothing
+    Set objStore = Nothing
     Exit Sub
 
 ErrHandler:
-    LogVBAError "SyncPostfach"
+    HandleError "modSync", "SyncPostfach"
+    Set objRoot = Nothing
+    Set objStore = Nothing
 End Sub
 
 
@@ -530,14 +731,14 @@ Public Function ErstelleSyncProfil(ByVal strName As String, _
 
     ' Pruefen ob Profil bereits existiert
     Dim varID As Variant
-    varID = DLookup("ProfilID", "tblSyncProfil", "ProfilName='" & SQLSafe(strName) & "'")
+    varID = DLookup("ProfilID", TBL_SYNC_PROFIL, "ProfilName='" & SQLSafe(strName) & "'")
     If Not IsNull(varID) Then
         LogWarn "Sync-Profil '" & strName & "' existiert bereits (ID=" & varID & ")", "SYNC"
         ErstelleSyncProfil = CLng(varID)
         Exit Function
     End If
 
-    Set rs = db.OpenRecordset("tblSyncProfil", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_SYNC_PROFIL, dbOpenDynaset)
     With rs
         .AddNew
         !ProfilName = Left(strName, 100)
@@ -559,7 +760,7 @@ Public Function ErstelleSyncProfil(ByVal strName As String, _
     Exit Function
 
 ErrHandler:
-    LogVBAError "ErstelleSyncProfil"
+    HandleError "modSync", "ErstelleSyncProfil"
     ErstelleSyncProfil = 0
 End Function
 
@@ -572,7 +773,7 @@ Public Sub ProfilOrdnerHinzufuegen(ByVal lngProfilID As Long, _
     Dim db As DAO.Database, rs As DAO.Recordset
 
     Set db = CurrentDb
-    Set rs = db.OpenRecordset("tblSyncProfilOrdner", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_SYNC_PROFIL_ORDNER, dbOpenDynaset)
 
     With rs
         .AddNew
@@ -589,7 +790,7 @@ Public Sub ProfilOrdnerHinzufuegen(ByVal lngProfilID As Long, _
     Exit Sub
 
 ErrHandler:
-    LogVBAError "ProfilOrdnerHinzufuegen"
+    HandleError "modSync", "ProfilOrdnerHinzufuegen"
 End Sub
 
 
@@ -607,7 +808,7 @@ Public Sub SyncMitProfil(ByVal strProfilName As String)
     Dim db As DAO.Database, rsProfil As DAO.Recordset
     Set db = CurrentDb
     Set rsProfil = db.OpenRecordset( _
-        "SELECT * FROM tblSyncProfil WHERE ProfilName='" & SQLSafe(strProfilName) & "'" & _
+        "SELECT * FROM [" & TBL_SYNC_PROFIL & "] WHERE ProfilName='" & SQLSafe(strProfilName) & "'" & _
         " AND IstAktiv=True", dbOpenSnapshot)
 
     If rsProfil.EOF Then
@@ -631,9 +832,9 @@ Public Sub SyncMitProfil(ByVal strProfilName As String)
 
     ' Export-Pfad (Profil-spezifisch oder Standard)
     Dim strExport As String
-    strExport = Nz(DLookup("ExportPfad", "tblSyncProfil", "ProfilID=" & lngProfilID), "")
+    strExport = Nz(DLookup("ExportPfad", TBL_SYNC_PROFIL, "ProfilID=" & lngProfilID), "")
     If strExport <> "" Then
-        SchreibeConfig "ExportBasisPfad", strExport
+        CacheSetConfig CFG_EXPORT_PFAD, strExport
     End If
 
     Debug.Print String(70, "=")
@@ -650,7 +851,7 @@ Public Sub SyncMitProfil(ByVal strProfilName As String)
     ' Ordner des Profils laden und synchronisieren
     Dim rsOrdner As DAO.Recordset
     Set rsOrdner = db.OpenRecordset( _
-        "SELECT OrdnerPfad, PostfachName FROM tblSyncProfilOrdner " & _
+        "SELECT OrdnerPfad, PostfachName FROM [" & TBL_SYNC_PROFIL_ORDNER & "] " & _
         "WHERE ProfilID=" & lngProfilID & " AND IstAktiv=True", dbOpenSnapshot)
 
     Dim lngOrdnerCount As Long: lngOrdnerCount = 0
@@ -689,5 +890,7 @@ Public Sub SyncMitProfil(ByVal strProfilName As String)
     Exit Sub
 
 ErrHandler:
-    LogVBAError "SyncMitProfil"
+    HandleError "modSync", "SyncMitProfil"
 End Sub
+
+

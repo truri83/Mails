@@ -1,4 +1,3 @@
-Attribute VB_Name = "modTestPerformance"
 Option Compare Database
 Option Explicit
 
@@ -35,6 +34,8 @@ Option Explicit
 '   TestDBPerformance "\\Server\Share\Pfad\"            ' Nur DB
 '   TestOutlookExtraktion                               ' Nur Outlook
 '   TestOutlookExtraktion 100                           ' 100 Mails testen
+'   TestSyncLasttest "Postfach\\Ordner"                    ' End-to-End Sync Lasttest
+'   TestSyncLasttest "Postfach\\Ordner", 5, 300, 8, True  ' 5 Laeufe, 300 Mails, 8s Pause
 '   TestHashingSpeed                                    ' Nur SHA256
 '
 ' Abhaengigkeiten: Keine (komplett eigenstaendig)
@@ -719,7 +720,7 @@ Private Sub TestSchreibMethoden_Linked()
         rs!Absender = "User " & n
         rs!AbsenderEmail = "user" & n & "@test.de"
         rs!DatumGesendet = Now
-        rs!Groesse = 50000&
+        rs!Groesse = 50000
         rs!ErstelltAm = Now
         rs.Update
     Next n
@@ -745,9 +746,9 @@ Private Sub TestSchreibMethoden_Linked()
             "'Execute Test " & n & "', " & _
             "'User " & n & "', " & _
             "'user" & n & "@test.de', " & _
-            "#" & Format(Now, "mm\/dd\/yyyy hh\:nn\:ss") & "#, " & _
+            SQLJetzt() & ", " & _
             "50000, " & _
-            "#" & Format(Now, "mm\/dd\/yyyy hh\:nn\:ss") & "#)", dbFailOnError
+            SQLJetzt() & ")", dbFailOnError
     Next n
     ws.CommitTrans: blnTO = False
     t2 = GetTickCount()
@@ -1714,6 +1715,325 @@ End Sub
 
 
 ' ===========================================================================
+' BEREICH 3b: ECHTER SYNC-LASTTEST (End-to-End)
+' ===========================================================================
+
+' Fuehrt einen Lasttest gegen den echten Sync-Pfad durch (modSync.SyncFolder).
+' Fokus: Outlook-Stabilitaet, COM-Retries/Reconnects, Laufzeit unter Last.
+'
+' Parameter:
+'   strOrdnerPfad  - Voller Outlook-Pfad (z.B. "Postfach\Posteingang\FLIWAS")
+'   lngLaeufe      - Anzahl Durchlaeufe (Standard: 3)
+'   lngMaxMails    - Max Mails pro Lauf (Standard: 250)
+'   lngPauseSek    - Pause zwischen Laeufen in Sekunden (Standard: 5)
+'   blnSubfolder   - Unterordner mit synchronisieren?
+'
+' Hinweis:
+'   - Nutzt die produktive Sync-Routine inkl. DB/Datei-I/O.
+'   - Vorab in Testumgebung oder mit begrenztem Mail-Limit starten.
+Public Sub TestSyncLasttest(ByVal strOrdnerPfad As String, _
+                             Optional ByVal lngLaeufe As Long = 3, _
+                             Optional ByVal lngMaxMails As Long = 250, _
+                             Optional ByVal lngPauseSek As Long = 5, _
+                             Optional ByVal blnSubfolder As Boolean = False)
+    On Error GoTo ErrHandler
+
+    Dim i As Long
+    Dim t1 As Long, t2 As Long
+    Dim lngErr As Long
+    Dim strErr As String
+    Dim lngRunMS As Long
+    Dim lngMin As Long, lngMax As Long, lngSum As Long
+    Dim lngFail As Long, lngOK As Long
+    Dim lngRetriesDelta As Long, lngReconnectsDelta As Long
+    Dim lngRetriesSum As Long, lngReconnectsSum As Long
+    Dim lngRetriesBefore As Long, lngReconnectsBefore As Long
+    Dim lngRetriesAfter As Long, lngReconnectsAfter As Long
+    Dim strFolderEntryID As String
+    Dim strFolderStoreID As String
+    Dim objRunFolder As Object
+
+    If Trim$(strOrdnerPfad) = "" Then
+        Debug.Print "*** FEHLER: Ordnerpfad erforderlich."
+        Debug.Print "    Beispiel: TestSyncLasttest ""Postfach\Posteingang\FLIWAS"""
+        Exit Sub
+    End If
+
+    If lngLaeufe < 1 Then lngLaeufe = 1
+    If lngLaeufe > 50 Then lngLaeufe = 50
+    If lngMaxMails < 1 Then lngMaxMails = 1
+    If lngPauseSek < 0 Then lngPauseSek = 0
+
+    If Not ConnectRDO() Then
+        Debug.Print "*** FEHLER: Keine RDO-Verbindung (Outlook/Redemption nicht bereit)."
+        Exit Sub
+    End If
+
+    ' Vorab pruefen, ob Ordner erreichbar ist (robuste Aufloesung).
+    Dim objProbe As Object
+    Debug.Print "[LASTTEST] Resolving Ordnerpfad..."
+    DoEvents
+    Set objProbe = ResolveSyncLasttestOrdner(strOrdnerPfad)
+    If objProbe Is Nothing Then
+        Debug.Print "*** FEHLER: Ordner nicht gefunden: " & strOrdnerPfad
+        Debug.Print "    Verfuegbare Stores:"
+        PrintVerfuegbareStores
+        Debug.Print "    Tipp: Nutze exakten Store-Namen + Ordnerpfad,"
+        Debug.Print "          z.B. ""<StoreName>\Posteingang\Unterordner""."
+        Exit Sub
+    End If
+
+    On Error Resume Next
+    strFolderEntryID = Nz(objProbe.EntryID, "")
+    strFolderStoreID = Nz(objProbe.StoreID, "")
+    On Error GoTo ErrHandler
+    If strFolderEntryID = "" Then
+        Debug.Print "*** FEHLER: Ordner-EntryID nicht lesbar."
+        Set objProbe = Nothing
+        Exit Sub
+    End If
+
+    Debug.Print "[LASTTEST] Ordner aufgeloest: " & Nz(objProbe.FolderPath, strOrdnerPfad)
+    DoEvents
+    Set objProbe = Nothing
+
+    Debug.Print ""
+    Debug.Print String(80, "=")
+    Debug.Print "  SYNC-LASTTEST (ECHTER END-TO-END PFAD)"
+    Debug.Print String(80, "=")
+    Debug.Print "  Start       : " & Now()
+    Debug.Print "  Ordner      : " & strOrdnerPfad
+    Debug.Print "  Laeufe      : " & lngLaeufe
+    Debug.Print "  Max/Lauf    : " & lngMaxMails
+    Debug.Print "  Subfolder   : " & IIf(blnSubfolder, "Ja", "Nein")
+    Debug.Print "  Pause       : " & lngPauseSek & " s"
+    Debug.Print String(80, "-")
+    Debug.Print PadR("Lauf", 8) & PadR("Status", 12) & PadR("Dauer", 12) & _
+                PadR("COM-Retry", 12) & PadR("Reconnect", 12) & "Fehler"
+    Debug.Print String(80, "-")
+
+    lngMin = 0
+    lngMax = 0
+
+    For i = 1 To lngLaeufe
+        DoEvents
+
+        lngRetriesBefore = COMRetryZaehler()
+        lngReconnectsBefore = COMReconnectZaehler()
+
+        lngErr = 0
+        strErr = ""
+
+        Debug.Print "[LASTTEST] Lauf " & i & "/" & lngLaeufe & ": hole Ordner per EntryID..."
+        DoEvents
+
+        Set objRunFolder = Nothing
+        On Error Resume Next
+        If strFolderStoreID <> "" Then
+            Set objRunFolder = g_objRDO.GetFolderFromID(strFolderEntryID, strFolderStoreID)
+        Else
+            Set objRunFolder = g_objRDO.GetFolderFromID(strFolderEntryID)
+        End If
+        On Error GoTo ErrHandler
+
+        If objRunFolder Is Nothing Then
+            ' Fallback nur wenn noetig (kann teuer sein)
+            Debug.Print "[LASTTEST] Fallback: erneute Pfadauflosung..."
+            DoEvents
+            Set objRunFolder = ResolveSyncLasttestOrdner(strOrdnerPfad)
+        End If
+
+        If objRunFolder Is Nothing Then
+            lngFail = lngFail + 1
+            Debug.Print PadR("#" & i, 8) & PadR("FAIL", 12) & _
+                        PadR("-", 12) & PadR("0", 12) & PadR("0", 12) & _
+                        "Ordner konnte vor Lauf nicht aufgeloest werden"
+            GoTo NextRun
+        End If
+
+        t1 = GetTickCount()
+        On Error Resume Next
+        SyncFolder objRunFolder, "Lasttest", "Run" & Format$(i, "00"), lngMaxMails, blnSubfolder
+        lngErr = Err.Number
+        strErr = Err.Description
+        Err.Clear
+        On Error GoTo ErrHandler
+        t2 = GetTickCount()
+        Set objRunFolder = Nothing
+
+        lngRunMS = t2 - t1
+        lngRetriesAfter = COMRetryZaehler()
+        lngReconnectsAfter = COMReconnectZaehler()
+        lngRetriesDelta = lngRetriesAfter - lngRetriesBefore
+        lngReconnectsDelta = lngReconnectsAfter - lngReconnectsBefore
+
+        lngRetriesSum = lngRetriesSum + lngRetriesDelta
+        lngReconnectsSum = lngReconnectsSum + lngReconnectsDelta
+
+        If lngErr = 0 Then
+            lngOK = lngOK + 1
+            lngSum = lngSum + lngRunMS
+            If lngMin = 0 Or lngRunMS < lngMin Then lngMin = lngRunMS
+            If lngRunMS > lngMax Then lngMax = lngRunMS
+
+            Debug.Print PadR("#" & i, 8) & PadR("OK", 12) & _
+                        PadR(FormatMS(lngRunMS), 12) & _
+                        PadR(CStr(lngRetriesDelta), 12) & _
+                        PadR(CStr(lngReconnectsDelta), 12) & "-"
+        Else
+            lngFail = lngFail + 1
+            Debug.Print PadR("#" & i, 8) & PadR("FAIL", 12) & _
+                        PadR(FormatMS(lngRunMS), 12) & _
+                        PadR(CStr(lngRetriesDelta), 12) & _
+                        PadR(CStr(lngReconnectsDelta), 12) & _
+                        Left$("[" & lngErr & "] " & Nz(strErr, ""), 120)
+        End If
+
+        If i < lngLaeufe And lngPauseSek > 0 Then
+            Sleep CLng(lngPauseSek) * 1000&
+        End If
+
+NextRun:
+        Set objRunFolder = Nothing
+    Next i
+
+    Debug.Print String(80, "-")
+    Debug.Print "  ZUSAMMENFASSUNG"
+    Debug.Print "  Erfolgreich  : " & lngOK & "/" & lngLaeufe
+    Debug.Print "  Fehlgeschlag.: " & lngFail
+    If lngOK > 0 Then
+        Debug.Print "  Durchschnitt : " & FormatMS(CLng(lngSum / lngOK))
+        Debug.Print "  Min/Max      : " & FormatMS(lngMin) & " / " & FormatMS(lngMax)
+    End If
+    Debug.Print "  COM-Retries  : " & lngRetriesSum
+    Debug.Print "  Reconnects   : " & lngReconnectsSum
+    Debug.Print "  Ende         : " & Now()
+    Debug.Print String(80, "=")
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "*** FEHLER in TestSyncLasttest: [" & Err.Number & "] " & Err.Description
+End Sub
+
+
+' Robuste Ordner-Aufloesung fuer Lasttest:
+'   1) Exakter Pfad ueber OeffneOrdner
+'   2) Fallback: Suffix-Match gegen FolderPath in allen Stores
+Private Function ResolveSyncLasttestOrdner(ByVal strOrdnerPfad As String) As Object
+    On Error GoTo ErrHandler
+
+    Dim strNorm As String
+    strNorm = NormalizeSyncPfad(strOrdnerPfad)
+    If strNorm = "" Then
+        Set ResolveSyncLasttestOrdner = Nothing
+        Exit Function
+    End If
+
+    ' 1) Exakter Match
+    Set ResolveSyncLasttestOrdner = OeffneOrdner(strNorm)
+    If Not ResolveSyncLasttestOrdner Is Nothing Then Exit Function
+
+    ' 2) Fallback: in allen Stores nach passendem Suffix suchen
+    Dim objStore As Object
+    Dim objFound As Object
+    For Each objStore In g_objRDO.Stores
+        Set objFound = FindFolderByPathSuffix(objStore.RootFolder, strNorm, 0, 12)
+        If Not objFound Is Nothing Then
+            Set ResolveSyncLasttestOrdner = objFound
+            Set objFound = Nothing
+            Set objStore = Nothing
+            Exit Function
+        End If
+        Set objFound = Nothing
+        Set objStore = Nothing
+    Next objStore
+
+    Set ResolveSyncLasttestOrdner = Nothing
+    Exit Function
+
+ErrHandler:
+    Set ResolveSyncLasttestOrdner = Nothing
+End Function
+
+
+' Rekursive Suche nach FolderPath-EndsWith(target)
+Private Function FindFolderByPathSuffix(objFolder As Object, _
+                                        ByVal strTargetNorm As String, _
+                                        ByVal lngDepth As Long, _
+                                        ByVal lngMaxDepth As Long) As Object
+    On Error GoTo ErrHandler
+
+    If objFolder Is Nothing Then Exit Function
+    If lngDepth > lngMaxDepth Then Exit Function
+
+    Dim strPath As String
+    strPath = NormalizeSyncPfad(Nz(objFolder.FolderPath, ""))
+
+    If strPath <> "" Then
+        If StrComp(strPath, strTargetNorm, vbTextCompare) = 0 Then
+            Set FindFolderByPathSuffix = objFolder
+            Exit Function
+        End If
+
+        ' Erlaubt Aufruf ohne exakten Store-Namen.
+        If Right$("\\" & strPath, Len("\\" & strTargetNorm) + 1) = "\\" & strTargetNorm Then
+            Set FindFolderByPathSuffix = objFolder
+            Exit Function
+        End If
+    End If
+
+    Dim objSub As Object
+    Dim objFound As Object
+    For Each objSub In objFolder.Folders
+        Set objFound = FindFolderByPathSuffix(objSub, strTargetNorm, lngDepth + 1, lngMaxDepth)
+        If Not objFound Is Nothing Then
+            Set FindFolderByPathSuffix = objFound
+            Set objFound = Nothing
+            Set objSub = Nothing
+            Exit Function
+        End If
+        Set objFound = Nothing
+        Set objSub = Nothing
+    Next objSub
+
+    Set objSub = Nothing
+    Exit Function
+
+ErrHandler:
+    Set FindFolderByPathSuffix = Nothing
+End Function
+
+
+' Vereinheitlicht Outlook-Pfade fuer robuste Vergleiche.
+Private Function NormalizeSyncPfad(ByVal strPfad As String) As String
+    strPfad = Trim$(Nz(strPfad, ""))
+    If strPfad = "" Then
+        NormalizeSyncPfad = ""
+        Exit Function
+    End If
+
+    Do While Right$(strPfad, 1) = "\\"
+        strPfad = Left$(strPfad, Len(strPfad) - 1)
+        If strPfad = "" Then Exit Do
+    Loop
+
+    NormalizeSyncPfad = strPfad
+End Function
+
+
+' Gibt die aktuellen Store-Namen als Diagnose aus.
+Private Sub PrintVerfuegbareStores()
+    On Error Resume Next
+    Dim objStore As Object
+    For Each objStore In g_objRDO.Stores
+        Debug.Print "      - " & Nz(objStore.DisplayName, "(ohne Namen)")
+    Next objStore
+    Set objStore = Nothing
+    On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
 ' BEREICH 4: SHA256-HASHING PERFORMANCE
 ' ===========================================================================
 
@@ -2047,3 +2367,5 @@ Private Function LeseConfigStandalone(ByVal strKey As String, _
     Err.Clear
     On Error GoTo 0
 End Function
+
+

@@ -1,4 +1,3 @@
-Attribute VB_Name = "modOrdner"
 Option Compare Database
 Option Explicit
 
@@ -110,6 +109,8 @@ Public Function ScanneAlleOrdner(Optional ByVal blnTabelleLeeren As Boolean = Tr
         m_lngStoresGescannt = m_lngStoresGescannt + 1
 
 NaechsterStore:
+        Set objRoot = Nothing
+        Set objStore = Nothing
     Next objStore
 
     ' Statistik ausgeben
@@ -121,11 +122,15 @@ NaechsterStore:
     ScanneAlleOrdner = m_lngOrdnerGesamt
 
     Set objRoot = Nothing
+    Set objStore = Nothing
     Set objNamespace = Nothing
     Exit Function
 
 ErrHandler:
-    LogVBAError "ScanneAlleOrdner"
+    HandleError "modOrdner", "ScanneAlleOrdner"
+    Set objRoot = Nothing
+    Set objStore = Nothing
+    Set objNamespace = Nothing
     ScanneAlleOrdner = -1
 End Function
 
@@ -196,13 +201,15 @@ Public Sub ScanneOrdnerRekursiv(objFolder As Object, _
         DoEvents
         If g_blnAbbrechen Then Exit For
         ScanneOrdnerRekursiv objSub, lngOrdnerID, strPostfach, iTiefe + 1
+        Set objSub = Nothing
     Next objSub
 
     Set objSub = Nothing
     Exit Sub
 
 ErrHandler:
-    LogVBAError "ScanneOrdnerRekursiv(" & strName & ")"
+    HandleError "modOrdner", "ScanneOrdnerRekursiv", strName
+    Set objSub = Nothing
 End Sub
 
 
@@ -257,12 +264,12 @@ End Function
 ' Tabelle tblOutlookOrdner leeren
 Public Sub LeereOrdnerTabelle()
     On Error GoTo ErrHandler
-    CurrentDb.Execute "DELETE FROM tblOutlookOrdner", dbFailOnError
-    LogInfo "tblOutlookOrdner geleert", "ORDNER"
+    CurrentDb.Execute "DELETE FROM [" & TBL_OUTLOOK_ORDNER & "]", dbFailOnError
+    LogInfo TBL_OUTLOOK_ORDNER & " geleert", "ORDNER"
     Exit Sub
 
 ErrHandler:
-    LogVBAError "LeereOrdnerTabelle"
+    HandleError "modOrdner", "LeereOrdnerTabelle"
 End Sub
 
 
@@ -286,3 +293,5 @@ Private Function IstIgnorierterOrdner(ByVal strName As String) As Boolean
         IstIgnorierterOrdner = False
     End If
 End Function
+
+

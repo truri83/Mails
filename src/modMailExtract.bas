@@ -1,4 +1,3 @@
-Attribute VB_Name = "modMailExtract"
 Option Compare Database
 Option Explicit
 
@@ -142,7 +141,14 @@ Public Sub ExtrahiereKomplett(objRDOMail As Object, _
 
 ErrHandler:
     mk.Mail.IstGueltig = False
-    LogVBAError "ExtrahiereKomplett [" & Left(Nz(mk.Mail.Betreff, "?"), 30) & "]"
+    Dim strKlasse As String
+    strKlasse = KlassifiziereCOMFehler(Err.Number)
+    If strKlasse = "FATAL" Then
+        LogError "ExtrahiereKomplett FATAL (" & Err.Number & "): " & _
+                 Err.Description, "EXTRACT"
+    Else
+        HandleError "modMailExtract", "ExtrahiereKomplett", Left(Nz(mk.Mail.Betreff, "?"), 30)
+    End If
 End Sub
 
 
@@ -155,19 +161,15 @@ Private Function ExtrahiereMailDaten(objRDOMail As Object) As TypMailDaten
     On Error Resume Next
 
     ' --- Identifikation ---
-    md.EntryID = Nz(objRDOMail.EntryID, "")
-    If Err.Number <> 0 Then Err.Clear
+    md.EntryID = CStr(SichererCOMZugriff(objRDOMail, "EntryID", ""))
 
     ' --- Betreff ---
-    md.Betreff = Nz(objRDOMail.Subject, "")
-    If Err.Number <> 0 Then Err.Clear
+    md.Betreff = CStr(SichererCOMZugriff(objRDOMail, "Subject", ""))
 
     ' --- Absender ---
-    md.AbsenderName = Nz(objRDOMail.SenderName, "")
-    If Err.Number <> 0 Then Err.Clear
+    md.AbsenderName = CStr(SichererCOMZugriff(objRDOMail, "SenderName", ""))
 
-    md.AbsenderEmailTyp = Nz(objRDOMail.SenderEmailType, "SMTP")
-    If Err.Number <> 0 Then Err.Clear: md.AbsenderEmailTyp = "SMTP"
+    md.AbsenderEmailTyp = CStr(SichererCOMZugriff(objRDOMail, "SenderEmailType", "SMTP"))
 
     ' SMTP-Adresse aufloesen (via modOutlookConnect)
     On Error GoTo 0
@@ -176,50 +178,55 @@ Private Function ExtrahiereMailDaten(objRDOMail As Object) As TypMailDaten
     If Err.Number <> 0 Then Err.Clear: md.AbsenderEmail = DEFAULT_EMAIL
 
     ' --- Zeiten ---
-    md.EmpfangenAm = Nz(objRDOMail.ReceivedTime, Now)
-    If Err.Number <> 0 Then Err.Clear: md.EmpfangenAm = Now
+    Dim varZeit As Variant
+    varZeit = SichererCOMZugriff(objRDOMail, "ReceivedTime", Now)
+    If IsDate(varZeit) Then md.EmpfangenAm = CDate(varZeit) Else md.EmpfangenAm = Now
 
-    md.GesendetAm = Nz(objRDOMail.SentOn, md.EmpfangenAm)
-    If Err.Number <> 0 Then Err.Clear: md.GesendetAm = md.EmpfangenAm
+    varZeit = SichererCOMZugriff(objRDOMail, "SentOn", md.EmpfangenAm)
+    If IsDate(varZeit) Then md.GesendetAm = CDate(varZeit) Else md.GesendetAm = md.EmpfangenAm
 
     ' --- Groesse + Status ---
-    md.Groesse = objRDOMail.Size
-    If Err.Number <> 0 Then Err.Clear: md.Groesse = 0
+    md.Groesse = CLng(SichererCOMZugriff(objRDOMail, "Size", 0))
+    md.Wichtigkeit = CInt(SichererCOMZugriff(objRDOMail, "Importance", 1))
 
-    md.Wichtigkeit = objRDOMail.Importance
-    If Err.Number <> 0 Then Err.Clear: md.Wichtigkeit = 1
-
-    md.Gelesen = Not objRDOMail.UnRead
-    If Err.Number <> 0 Then Err.Clear: md.Gelesen = False
+    Dim varUnread As Variant
+    varUnread = SichererCOMZugriff(objRDOMail, "UnRead", True)
+    md.Gelesen = Not CBool(varUnread)
 
     ' --- Anhaenge ---
-    md.AnhangAnzahl = objRDOMail.Attachments.Count
-    If Err.Number <> 0 Then Err.Clear: md.AnhangAnzahl = 0
+    Dim objAtts As Object
+    Set objAtts = Nothing
+    On Error Resume Next
+    Set objAtts = objRDOMail.Attachments
+    If Err.Number <> 0 Then Err.Clear
+    If Not objAtts Is Nothing Then
+        md.AnhangAnzahl = objAtts.Count
+        If Err.Number <> 0 Then Err.Clear: md.AnhangAnzahl = 0
+    Else
+        md.AnhangAnzahl = 0
+    End If
+    Set objAtts = Nothing
     md.HatAnhaenge = (md.AnhangAnzahl > 0)
 
     ' --- MessageClass ---
-    md.MessageClass = Nz(objRDOMail.MessageClass, "IPM.Note")
-    If Err.Number <> 0 Then Err.Clear: md.MessageClass = "IPM.Note"
+    md.MessageClass = CStr(SichererCOMZugriff(objRDOMail, "MessageClass", "IPM.Note"))
 
-    ' --- MAPI Properties ---
-    md.InternetMessageID = objRDOMail.Fields(PR_INTERNET_MESSAGE_ID)
+    ' --- MAPI Properties (via Fields, kein CallByName moeglich) ---
+    md.InternetMessageID = Nz(objRDOMail.Fields(PR_INTERNET_MESSAGE_ID), "")
     If Err.Number <> 0 Then Err.Clear: md.InternetMessageID = ""
 
-    md.DisplayTo = objRDOMail.Fields(PR_DISPLAY_TO)
+    md.DisplayTo = Nz(objRDOMail.Fields(PR_DISPLAY_TO), "")
     If Err.Number <> 0 Then Err.Clear: md.DisplayTo = ""
 
     ' --- Transport-Headers -> In-Reply-To ---
     Dim strHeaders As String
-    strHeaders = objRDOMail.Fields(PR_TRANSPORT_MESSAGE_HEADERS)
+    strHeaders = Nz(objRDOMail.Fields(PR_TRANSPORT_MESSAGE_HEADERS), "")
     If Err.Number <> 0 Then Err.Clear: strHeaders = ""
     md.InReplyTo = ParseHeaderField(strHeaders, "In-Reply-To")
 
     ' --- Content (HTML + Plain) ---
-    md.HTMLBody = Nz(objRDOMail.HTMLBody, "")
-    If Err.Number <> 0 Then Err.Clear: md.HTMLBody = ""
-
-    md.PlainTextBody = Nz(objRDOMail.Body, "")
-    If Err.Number <> 0 Then Err.Clear: md.PlainTextBody = ""
+    md.HTMLBody = CStr(SichererCOMZugriff(objRDOMail, "HTMLBody", ""))
+    md.PlainTextBody = CStr(SichererCOMZugriff(objRDOMail, "Body", ""))
 
     On Error GoTo 0
     md.IstGueltig = True
@@ -264,10 +271,12 @@ Private Sub ExtrahiereEmpfaengerIn(ByRef mk As TypMailKomplett, objRDOMail As Ob
         If Err.Number <> 0 Then Err.Clear
 
         i = i + 1
+        Set objRec = Nothing
     Next objRec
 
     ' Tatsaechliche Anzahl (falls weniger gelesen)
     mk.EmpfaengerAnzahl = i
+    Set objRec = Nothing
     On Error GoTo 0
 End Sub
 
@@ -326,8 +335,10 @@ Private Sub ExtrahiereAnhaengeIn(ByRef mk As TypMailKomplett, _
             mk.Anhaenge(a - 1).TempPfad = SpeichereAnhangZuTemp(objAtt)
         End If
 
+        Set objAtt = Nothing   ' COM-Lease sofort freigeben
 NaechsterAnhang:
     Next a
+    Set objAtt = Nothing
     On Error GoTo 0
 End Sub
 
@@ -398,7 +409,7 @@ End Function
 ' Gibt den Temp-Verzeichnispfad zurueck (mit abschliessendem \)
 Public Function HoleTempPfad() As String
     Dim strTemp As String
-    strTemp = LeseConfig("TempPfad", "")
+    strTemp = CacheGetConfig(CFG_TEMP_PFAD, "")
 
     If strTemp = "" Then
         strTemp = Environ("TEMP")
@@ -475,3 +486,5 @@ Public Function ParseHeaderField(ByVal strHeaders As String, _
 
     ParseHeaderField = Trim(Mid(strHeaders, pos, posEnd - pos))
 End Function
+
+

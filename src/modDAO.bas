@@ -1,4 +1,3 @@
-Attribute VB_Name = "modDAO"
 Option Compare Database
 Option Explicit
 
@@ -23,10 +22,18 @@ Public Function StarteSyncLauf(ByVal strOrdnerPfad As String, _
                                 ByVal strProjekt As String, _
                                 ByVal strPhase As String) As Long
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz: Backend pruefen BEVOR wir auf Linked Tables zugreifen
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "StarteSyncLauf: Backend offline - uebersprungen", "DAO"
+        StarteSyncLauf = 0
+        Exit Function
+    End If
+    
     Dim db As DAO.Database, rs As DAO.Recordset
 
     Set db = CurrentDb
-    Set rs = db.OpenRecordset("tblSyncLauf", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_SYNC_LAUF, dbOpenDynaset)
 
     With rs
         .AddNew
@@ -45,7 +52,11 @@ Public Function StarteSyncLauf(ByVal strOrdnerPfad As String, _
     Exit Function
 
 ErrHandler:
-    LogVBAError "StarteSyncLauf"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "StarteSyncLauf") Then
+        StarteSyncLauf = 0
+        Exit Function
+    End If
+    HandleError "modDAO", "StarteSyncLauf"
     StarteSyncLauf = 0
 End Function
 
@@ -57,11 +68,18 @@ Public Sub BeendeSyncLauf(ByVal lngSyncLaufID As Long, _
                            ByVal lngDuplikate As Long, _
                            ByVal lngFehler As Long)
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "BeendeSyncLauf: Backend offline - uebersprungen", "DAO"
+        Exit Sub
+    End If
+    
     Dim db As DAO.Database
 
     Set db = CurrentDb
-    db.Execute "UPDATE tblSyncLauf SET " & _
-               "EndeZeit = #" & Format(Now, "mm/dd/yyyy hh:nn:ss") & "#, " & _
+    db.Execute "UPDATE [" & TBL_SYNC_LAUF & "] SET " & _
+               "EndeZeit = " & SQLJetzt() & ", " & _
                "Status = '" & SQLSafe(strStatus) & "', " & _
                "AnzahlGelesen = " & lngGelesen & ", " & _
                "AnzahlNeu = " & lngNeu & ", " & _
@@ -75,7 +93,8 @@ Public Sub BeendeSyncLauf(ByVal lngSyncLaufID As Long, _
     Exit Sub
 
 ErrHandler:
-    LogVBAError "BeendeSyncLauf"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "BeendeSyncLauf") Then Exit Sub
+    HandleError "modDAO", "BeendeSyncLauf"
 End Sub
 
 
@@ -85,6 +104,7 @@ End Sub
 
 ' Kontakt suchen oder neu anlegen -> gibt KontaktID zurueck
 ' v0.2: Nutzt ParseKontaktName fuer erweiterte Felder (Vorname, Nachname, etc.)
+' v0.5.1: KontaktID-Cache fuer Performance (vermeidet wiederholte DB-Lookups)
 Public Function GetOderErstelleKontakt(ByVal strName As String, _
                                         ByVal strEmail As String, _
                                         Optional ByVal strEmailTyp As String = "SMTP") As Long
@@ -98,14 +118,28 @@ Public Function GetOderErstelleKontakt(ByVal strName As String, _
     strName = kontakt("Name")
     strEmail = kontakt("Email")
 
+    ' Cache-Pruefung: Bereits bekannte Email?
+    lngID = CacheGetKontaktID(strEmail)
+    If lngID > 0 Then
+        GetOderErstelleKontakt = lngID
+        Exit Function
+    End If
+
+    ' Netzwerk-Schutz: Backend pruefen BEVOR wir auf Linked Tables zugreifen
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "GetOderErstelleKontakt: Backend offline", "DAO"
+        GetOderErstelleKontakt = 0
+        Exit Function
+    End If
     Set db = CurrentDb
 
     ' 1. Zuerst nach Email suchen
     Set rs = db.OpenRecordset( _
-        "SELECT KontaktID FROM tblKontakte WHERE Email='" & SQLSafe(strEmail) & "'", dbOpenSnapshot)
+        "SELECT KontaktID FROM [" & TBL_KONTAKTE & "] WHERE Email='" & SQLSafe(strEmail) & "'", dbOpenSnapshot)
     If Not rs.EOF Then
         lngID = rs!KontaktID
         rs.Close: Set rs = Nothing: Set db = Nothing
+        CacheSetKontaktID strEmail, lngID
         GetOderErstelleKontakt = lngID
         Exit Function
     End If
@@ -113,10 +147,15 @@ Public Function GetOderErstelleKontakt(ByVal strName As String, _
 
     ' 2. Dann nach Anzeigename suchen
     Set rs = db.OpenRecordset( _
-        "SELECT KontaktID FROM tblKontakte WHERE Anzeigename='" & SQLSafe(strName) & "'", dbOpenSnapshot)
+        "SELECT KontaktID, Email FROM [" & TBL_KONTAKTE & "] WHERE Anzeigename='" & SQLSafe(strName) & "'", dbOpenSnapshot)
     If Not rs.EOF Then
         lngID = rs!KontaktID
+        Dim strExistEmail As String
+        strExistEmail = Nz(rs!Email, "")
         rs.Close: Set rs = Nothing: Set db = Nothing
+        ' Beide Emails cachen (original + gefundene)
+        CacheSetKontaktID strEmail, lngID
+        If strExistEmail <> "" Then CacheSetKontaktID strExistEmail, lngID
         GetOderErstelleKontakt = lngID
         Exit Function
     End If
@@ -135,7 +174,7 @@ Public Function GetOderErstelleKontakt(ByVal strName As String, _
         End If
     End If
 
-    Set rs = db.OpenRecordset("tblKontakte", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_KONTAKTE, dbOpenDynaset)
     With rs
         .AddNew
         !Anzeigename = Left(IIf(kn.Anzeigename <> "", kn.Anzeigename, strName), 255)
@@ -157,11 +196,16 @@ Public Function GetOderErstelleKontakt(ByVal strName As String, _
     rs.Close: Set rs = Nothing: Set db = Nothing
     LogDebug "Neuer Kontakt: ID=" & lngID & " " & strEmail & _
              " [" & kn.Vorname & " " & kn.Nachname & "]", "DAO"
+    CacheSetKontaktID strEmail, lngID
     GetOderErstelleKontakt = lngID
     Exit Function
 
 ErrHandler:
-    LogVBAError "GetOderErstelleKontakt"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "GetOderErstelleKontakt") Then
+        GetOderErstelleKontakt = 0
+        Exit Function
+    End If
+    HandleError "modDAO", "GetOderErstelleKontakt"
     GetOderErstelleKontakt = 0
 End Function
 
@@ -179,18 +223,26 @@ Public Function SpeichereOrdner(ByVal strName As String, _
                                  Optional ByVal lngElemente As Long = 0, _
                                  Optional ByVal strStoreID As String = "") As Long
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "SpeichereOrdner: Backend offline", "DAO"
+        SpeichereOrdner = 0
+        Exit Function
+    End If
+    
     Dim db As DAO.Database, rs As DAO.Recordset
     Dim varID As Variant
 
     Set db = CurrentDb
 
     ' Pruefen ob Ordner bereits existiert (per Pfad)
-    varID = DLookup("OrdnerID", "tblOutlookOrdner", "OrdnerPfad='" & SQLSafe(strPfad) & "'")
+    varID = DLookup("OrdnerID", TBL_OUTLOOK_ORDNER, "OrdnerPfad='" & SQLSafe(strPfad) & "'")
     If Not IsNull(varID) Then
         ' Aktualisieren: Elementanzahl + LetzterSync
-        db.Execute "UPDATE tblOutlookOrdner SET " & _
+        db.Execute "UPDATE [" & TBL_OUTLOOK_ORDNER & "] SET " & _
                    "ElementAnzahl=" & lngElemente & ", " & _
-                   "LetzterSync=#" & Format(Now, "mm/dd/yyyy hh:nn:ss") & "# " & _
+                   "LetzterSync=" & SQLJetzt() & " " & _
                    "WHERE OrdnerID=" & varID, dbFailOnError
         SpeichereOrdner = CLng(varID)
         Set db = Nothing
@@ -198,7 +250,7 @@ Public Function SpeichereOrdner(ByVal strName As String, _
     End If
 
     ' Neu anlegen
-    Set rs = db.OpenRecordset("tblOutlookOrdner", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_OUTLOOK_ORDNER, dbOpenDynaset)
     With rs
         .AddNew
         !OrdnerName = Left(Nz(strName, ""), 255)
@@ -222,7 +274,11 @@ Public Function SpeichereOrdner(ByVal strName As String, _
     Exit Function
 
 ErrHandler:
-    LogVBAError "SpeichereOrdner"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "SpeichereOrdner") Then
+        SpeichereOrdner = 0
+        Exit Function
+    End If
+    HandleError "modDAO", "SpeichereOrdner"
     SpeichereOrdner = 0
 End Function
 
@@ -238,6 +294,14 @@ Public Function GetOderErstelleThread(ByVal strBetreff As String, _
                                        Optional ByVal dtMailDatum As Date = 0, _
                                        Optional ByVal strAbsender As String = "") As Long
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "GetOderErstelleThread: Backend offline", "DAO"
+        GetOderErstelleThread = 0
+        Exit Function
+    End If
+    
     Dim db As DAO.Database, rs As DAO.Recordset
     Dim lngID As Long
     Dim strIdent As String
@@ -247,7 +311,7 @@ Public Function GetOderErstelleThread(ByVal strBetreff As String, _
     ' 1. Zuerst via In-Reply-To suchen (genaueste Zuordnung)
     If strInReplyTo <> "" Then
         Set rs = db.OpenRecordset( _
-            "SELECT ThreadID FROM tblEmailThreads WHERE ThreadIdentifier='" & SQLSafe(strInReplyTo) & "'", _
+            "SELECT ThreadID FROM [" & TBL_EMAIL_THREADS & "] WHERE ThreadIdentifier='" & SQLSafe(strInReplyTo) & "'", _
             dbOpenSnapshot)
         If Not rs.EOF Then
             lngID = rs!ThreadID
@@ -264,7 +328,7 @@ Public Function GetOderErstelleThread(ByVal strBetreff As String, _
     strIdent = BereinigeBetreff(strBetreff)
 
     Set rs = db.OpenRecordset( _
-        "SELECT ThreadID FROM tblEmailThreads WHERE ThreadIdentifier='" & SQLSafe(strIdent) & "'", _
+        "SELECT ThreadID FROM [" & TBL_EMAIL_THREADS & "] WHERE ThreadIdentifier='" & SQLSafe(strIdent) & "'", _
         dbOpenSnapshot)
     If Not rs.EOF Then
         lngID = rs!ThreadID
@@ -279,7 +343,7 @@ Public Function GetOderErstelleThread(ByVal strBetreff As String, _
     ' 3. Neuen Thread anlegen
     If dtMailDatum = 0 Then dtMailDatum = Now
 
-    Set rs = db.OpenRecordset("tblEmailThreads", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_EMAIL_THREADS, dbOpenDynaset)
     With rs
         .AddNew
         !ThreadBetreff = Left(strIdent, 255)
@@ -305,7 +369,11 @@ Public Function GetOderErstelleThread(ByVal strBetreff As String, _
     Exit Function
 
 ErrHandler:
-    LogVBAError "GetOderErstelleThread"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "GetOderErstelleThread") Then
+        GetOderErstelleThread = 0
+        Exit Function
+    End If
+    HandleError "modDAO", "GetOderErstelleThread"
     GetOderErstelleThread = 0
 End Function
 
@@ -317,7 +385,7 @@ Private Sub AktualisiereThread(db As DAO.Database, lngThreadID As Long, dtDatum 
     If dtDatum = 0 Then dtDatum = Now
 
     Set rs = db.OpenRecordset( _
-        "SELECT * FROM tblEmailThreads WHERE ThreadID=" & lngThreadID, dbOpenDynaset)
+        "SELECT * FROM [" & TBL_EMAIL_THREADS & "] WHERE ThreadID=" & lngThreadID, dbOpenDynaset)
     If Not rs.EOF Then
         rs.Edit
         rs!Antwortanzahl = rs!Antwortanzahl + 1
@@ -339,8 +407,21 @@ End Sub
 ' Pruefen ob Mail-Hash bereits in DB existiert
 Public Function ExistiertMailHash(ByVal strHash As String) As Boolean
     On Error Resume Next
-    ExistiertMailHash = (DCount("*", "tblEmails", "UniqueHash='" & SQLSafe(strHash) & "'") > 0)
+    ExistiertMailHash = (DCount("*", TBL_EMAILS, "UniqueHash='" & SQLSafe(strHash) & "'") > 0)
     If Err.Number <> 0 Then ExistiertMailHash = False: Err.Clear
+    On Error GoTo 0
+End Function
+
+' Pruefen ob InternetMessageID bereits in DB existiert (Dedup fuer CC-Empfaenger)
+Public Function ExistiertInternetMessageID(ByVal strMsgID As String) As Boolean
+    On Error Resume Next
+    If Nz(strMsgID, "") = "" Then
+        ExistiertInternetMessageID = False
+        Exit Function
+    End If
+    ExistiertInternetMessageID = (DCount("*", TBL_EMAILS, _
+        "InternetMessageID='" & SQLSafe(strMsgID) & "'") > 0)
+    If Err.Number <> 0 Then ExistiertInternetMessageID = False: Err.Clear
     On Error GoTo 0
 End Function
 
@@ -364,10 +445,18 @@ Public Function SpeichereEmail(ByVal strEntryID As String, _
                                 ByVal strMessageClass As String, _
                                 ByVal strInternetMsgID As String) As Long
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "SpeichereEmail: Backend offline", "DAO"
+        SpeichereEmail = 0
+        Exit Function
+    End If
+    
     Dim db As DAO.Database, rs As DAO.Recordset
 
     Set db = CurrentDb
-    Set rs = db.OpenRecordset("tblEmails", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_EMAILS, dbOpenDynaset)
 
     With rs
         .AddNew
@@ -401,7 +490,11 @@ Public Function SpeichereEmail(ByVal strEntryID As String, _
     Exit Function
 
 ErrHandler:
-    LogVBAError "SpeichereEmail"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "SpeichereEmail") Then
+        SpeichereEmail = 0
+        Exit Function
+    End If
+    HandleError "modDAO", "SpeichereEmail"
     SpeichereEmail = 0
 End Function
 
@@ -415,6 +508,13 @@ Public Sub SpeichereEmailContent(ByVal lngEmailID As Long, _
                                   ByVal strHTML As String, _
                                   ByVal strPlain As String)
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "SpeichereEmailContent: Backend offline", "DAO"
+        Exit Sub
+    End If
+    
     Dim db As DAO.Database, rs As DAO.Recordset
     Dim blnHatHTML As Boolean
 
@@ -423,7 +523,7 @@ Public Sub SpeichereEmailContent(ByVal lngEmailID As Long, _
     If Trim(Nz(strPlain, "")) = "" Then strPlain = ""
 
     Set db = CurrentDb
-    Set rs = db.OpenRecordset("tblEmailContent", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_EMAIL_CONTENT, dbOpenDynaset)
 
     With rs
         .AddNew
@@ -440,7 +540,8 @@ Public Sub SpeichereEmailContent(ByVal lngEmailID As Long, _
     Exit Sub
 
 ErrHandler:
-    LogVBAError "SpeichereEmailContent"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "SpeichereEmailContent") Then Exit Sub
+    HandleError "modDAO", "SpeichereEmailContent"
 End Sub
 
 
@@ -455,10 +556,17 @@ Public Sub SpeichereEmpfaenger(ByVal lngEmailID As Long, _
                                 ByVal strName As String, _
                                 ByVal strEmail As String)
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "SpeichereEmpfaenger: Backend offline", "DAO"
+        Exit Sub
+    End If
+    
     Dim db As DAO.Database, rs As DAO.Recordset
 
     Set db = CurrentDb
-    Set rs = db.OpenRecordset("tblEmailEmpfaenger", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_EMAIL_EMPFAENGER, dbOpenDynaset)
 
     With rs
         .AddNew
@@ -474,7 +582,8 @@ Public Sub SpeichereEmpfaenger(ByVal lngEmailID As Long, _
     Exit Sub
 
 ErrHandler:
-    LogVBAError "SpeichereEmpfaenger"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "SpeichereEmpfaenger") Then Exit Sub
+    HandleError "modDAO", "SpeichereEmpfaenger"
 End Sub
 
 
@@ -491,10 +600,18 @@ Public Function SpeichereAnhangMetadaten(ByVal lngEmailID As Long, _
                                           ByVal blnVersteckt As Boolean, _
                                           Optional ByVal strDateiPfad As String = "") As Long
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "SpeichereAnhangMetadaten: Backend offline", "DAO"
+        SpeichereAnhangMetadaten = 0
+        Exit Function
+    End If
+    
     Dim db As DAO.Database, rs As DAO.Recordset
 
     Set db = CurrentDb
-    Set rs = db.OpenRecordset("tblEmailAnhaenge", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_EMAIL_ANHAENGE, dbOpenDynaset)
 
     With rs
         .AddNew
@@ -518,20 +635,32 @@ Public Function SpeichereAnhangMetadaten(ByVal lngEmailID As Long, _
     Exit Function
 
 ErrHandler:
-    LogVBAError "SpeichereAnhangMetadaten"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "SpeichereAnhangMetadaten") Then
+        SpeichereAnhangMetadaten = 0
+        Exit Function
+    End If
+    HandleError "modDAO", "SpeichereAnhangMetadaten"
     SpeichereAnhangMetadaten = 0
 End Function
 
 ' Anhang-Dateipfad nachtraeglich aktualisieren (nach erfolgreichem SaveAsFile)
 Public Sub AktualisiereAnhangPfad(ByVal lngAnhangID As Long, ByVal strDateiPfad As String)
     On Error GoTo ErrHandler
-    CurrentDb.Execute "UPDATE tblEmailAnhaenge SET " & _
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "AktualisiereAnhangPfad: Backend offline", "DAO"
+        Exit Sub
+    End If
+    
+    CurrentDb.Execute "UPDATE [" & TBL_EMAIL_ANHAENGE & "] SET " & _
                       "DateiPfad='" & SQLSafe(strDateiPfad) & "', " & _
                       "IstGespeichert=True " & _
                       "WHERE AnhangID=" & lngAnhangID, dbFailOnError
     Exit Sub
 ErrHandler:
-    LogVBAError "AktualisiereAnhangPfad"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "AktualisiereAnhangPfad") Then Exit Sub
+    HandleError "modDAO", "AktualisiereAnhangPfad"
 End Sub
 
 
@@ -545,12 +674,19 @@ Public Sub SpeichereEmailStatus(ByVal lngEmailID As Long, _
                                  Optional ByVal strVon As String = "System", _
                                  Optional ByVal strBemerkung As String = "")
     On Error GoTo ErrHandler
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "SpeichereEmailStatus: Backend offline", "DAO"
+        Exit Sub
+    End If
+    
     Dim db As DAO.Database, rs As DAO.Recordset
 
     Set db = CurrentDb
 
     ' 1. Status in History-Tabelle eintragen
-    Set rs = db.OpenRecordset("tblEmailStatus", dbOpenDynaset)
+    Set rs = db.OpenRecordset(TBL_EMAIL_STATUS, dbOpenDynaset)
     With rs
         .AddNew
         !EmailID = lngEmailID
@@ -563,22 +699,33 @@ Public Sub SpeichereEmailStatus(ByVal lngEmailID As Long, _
     rs.Close: Set rs = Nothing
 
     ' 2. Status in Haupt-Tabelle aktualisieren
-    db.Execute "UPDATE tblEmails SET Status='" & SQLSafe(strStatus) & _
+    db.Execute "UPDATE [" & TBL_EMAILS & "] SET Status='" & SQLSafe(strStatus) & _
                "' WHERE EmailID=" & lngEmailID
 
     Set db = Nothing
     Exit Sub
 
 ErrHandler:
-    LogVBAError "SpeichereEmailStatus"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "SpeichereEmailStatus") Then Exit Sub
+    HandleError "modDAO", "SpeichereEmailStatus"
 End Sub
 
 ' MSG-Dateipfad in tblEmails nachtraeglich setzen
 Public Sub SetzeEmailMSGPfad(ByVal lngEmailID As Long, ByVal strPfad As String)
     On Error GoTo ErrHandler
-    CurrentDb.Execute "UPDATE tblEmails SET MSGDateiPfad='" & SQLSafe(strPfad) & _
+    
+    ' Netzwerk-Schutz
+    If Not PruefeBackendVorZugriff() Then
+        LogWarn "SetzeEmailMSGPfad: Backend offline", "DAO"
+        Exit Sub
+    End If
+    
+    CurrentDb.Execute "UPDATE [" & TBL_EMAILS & "] SET MSGDateiPfad='" & SQLSafe(strPfad) & _
                       "' WHERE EmailID=" & lngEmailID
     Exit Sub
 ErrHandler:
-    LogVBAError "SetzeEmailMSGPfad"
+    If BehandleNetzwerkFehler(Err.Number, "modDAO", "SetzeEmailMSGPfad") Then Exit Sub
+    HandleError "modDAO", "SetzeEmailMSGPfad"
 End Sub
+
+

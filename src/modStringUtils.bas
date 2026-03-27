@@ -1,4 +1,3 @@
-Attribute VB_Name = "modStringUtils"
 Option Compare Database
 Option Explicit
 
@@ -19,6 +18,9 @@ Option Explicit
 '   BereinigeNameInput   - Sonderzeichen aus Namen
 '   CapitalizeWord       - Gross-/Kleinschreibung + Adelspraedikate
 '   SQLSafe              - SQL-Injection-Schutz
+'   SQLDatum             - Locale-sicheres Datum fuer Jet SQL
+'   SQLJetzt             - SQLDatum(Now) Kurzform
+'   SQLNurDatum          - Nur Datum ohne Uhrzeit
 '   KuerzeAbsender       - Absender auf Kurzform
 '   RTrimSpecial         - Trailing Punkte/Leerzeichen (Windows)
 '
@@ -75,7 +77,7 @@ Public Function BereinigeBetreff(ByVal strBetreff As String) As String
     Dim objRE As Object
     Set objRE = CreateObject("VBScript.RegExp")
 
-    objRE.Pattern = "^(?:(RE|AW|FW|FWD|WG|EXTERN)(\s*[::])\s*)+"
+    objRE.Pattern = "^(?:(?:RE|AW|FW|FWD|WG)\s*[:::]\s*|EXTERN\s+)+"
     objRE.IgnoreCase = True
     objRE.Global = True
 
@@ -189,7 +191,7 @@ End Function
 Public Function NormalisierePfad(ByVal strPfad As String, _
                                   Optional ByVal blnAlsOrdner As Boolean = True) As String
     If Nz(strPfad, "") = "" Then
-        NormalisierePfad = Environ("USERPROFILE") & "\OutlookSync\"
+        NormalisierePfad = Environ("USERPROFILE") & PATH_DEFAULT_FALLBACK
         Exit Function
     End If
 
@@ -291,6 +293,40 @@ Public Function SQLSafe(ByVal strInput As String) As String
 End Function
 
 
+' ---------------------------------------------------------------------------
+' SQL-DATUM: Locale-sicheres Datum fuer Jet/ACE SQL-Statements
+' ---------------------------------------------------------------------------
+' PROBLEM: Format(Now, "mm/dd/yyyy") ersetzt "/" durch den lokalen
+'   Datumstrenner (DE: "." statt "/"). Jet erwartet aber US-Format.
+'   => #03.05.2026# ist UNGUELTIG, #03/05/2026# ist korrekt.
+'
+' LOESUNG: Diese Funktionen erzeugen IMMER locale-sichere SQL-Datum-Literals.
+'   Format$ mit escaped Separatoren (\/) erzwingt literale Schrägstriche.
+'
+' VERWENDUNG:
+'   db.Execute "UPDATE t SET Datum=" & SQLDatum(Now) & " WHERE ID=1"
+'   db.Execute "INSERT INTO t (Datum) VALUES (" & SQLJetzt() & ")"
+'
+' ACHTUNG: NIEMALS direkt Format(datum, "mm/dd/yyyy") in SQL verwenden!
+'          IMMER SQLDatum() oder SQLJetzt() nutzen!
+' ---------------------------------------------------------------------------
+
+' Gibt ein Date als Jet-SQL-Literal zurueck: #mm/dd/yyyy hh:nn:ss#
+Public Function SQLDatum(ByVal dtWert As Date) As String
+    SQLDatum = "#" & Format$(dtWert, "mm\/dd\/yyyy hh\:nn\:ss") & "#"
+End Function
+
+' Kurzform: Aktueller Zeitpunkt als SQL-Literal
+Public Function SQLJetzt() As String
+    SQLJetzt = SQLDatum(Now)
+End Function
+
+' Nur Datum ohne Uhrzeit: #mm/dd/yyyy#
+Public Function SQLNurDatum(ByVal dtWert As Date) As String
+    SQLNurDatum = "#" & Format$(dtWert, "mm\/dd\/yyyy") & "#"
+End Function
+
+
 ' ===========================================================================
 ' CAPITALIZE / NAME-BEREINIGUNG (v0.2)
 ' ===========================================================================
@@ -313,6 +349,9 @@ Public Function CapitalizeWord(ByVal strInput As String) As String
         For j = LBound(partsHyphen) To UBound(partsHyphen)
             If Len(partsHyphen(j)) > 0 Then
                 Select Case LCase(partsHyphen(j))
+
+
+                
                     Case "von", "van", "de", "der", "den"
                         partsHyphen(j) = LCase(partsHyphen(j))
                     Case Else
@@ -698,3 +737,5 @@ Public Function BereinigeOutlookPfad(ByVal strPfad As String) As String
 
     BereinigeOutlookPfad = strPfad
 End Function
+
+
