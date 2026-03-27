@@ -2,7 +2,7 @@ Option Compare Database
 Option Explicit
 
 ' ===========================================================================
-' modTestDualAccess - Tests fuer Dual-Access Queue/Worker (v0.7)
+' modTestDualAccess - Tests fuer Dual-Access Queue/Worker (v0.8)
 ' ===========================================================================
 ' Fokus:
 '   - Setup/Migration (Tabellen + Worker-Config)
@@ -350,11 +350,22 @@ Private Sub Test_DualAccessSetup()
     Dim blnSetup As Boolean
     blnSetup = SetupDualAccessNoAdmin(False)
 
+    If Not blnSetup Then
+        Debug.Print "[SETUP-DIAG] SetupDualAccessNoAdmin fehlgeschlagen"
+        Debug.Print "[SETUP-DIAG] BackendPfad:       " & Nz(CacheGetConfig(CFG_BACKEND_PFAD, ""), "(leer)")
+        Debug.Print "[SETUP-DIAG] " & TBL_SYNC_JOB & ": " & IIf(TabelleExistiert(TBL_SYNC_JOB), "OK", "FEHLT")
+        Debug.Print "[SETUP-DIAG] " & TBL_SYNC_HEARTBEAT & ": " & IIf(TabelleExistiert(TBL_SYNC_HEARTBEAT), "OK", "FEHLT")
+        Debug.Print "[SETUP-DIAG] " & TBL_SYNC_CONTROL & ": " & IIf(TabelleExistiert(TBL_SYNC_CONTROL), "OK", "FEHLT")
+        Debug.Print "[SETUP-DIAG] " & TBL_WORKER_LEASE & ": " & IIf(TabelleExistiert(TBL_WORKER_LEASE), "OK", "FEHLT")
+        Debug.Print "[SETUP-DIAG] " & TBL_WORKER_TRACE & ": " & IIf(TabelleExistiert(TBL_WORKER_TRACE), "OK", "FEHLT")
+    End If
+
     AssertIsTrue blnSetup, "SetupDualAccessNoAdmin(False) erfolgreich"
     AssertIsTrue TabelleExistiert(TBL_SYNC_JOB), TBL_SYNC_JOB & " existiert"
     AssertIsTrue TabelleExistiert(TBL_SYNC_HEARTBEAT), TBL_SYNC_HEARTBEAT & " existiert"
     AssertIsTrue TabelleExistiert(TBL_SYNC_CONTROL), TBL_SYNC_CONTROL & " existiert"
     AssertIsTrue TabelleExistiert(TBL_WORKER_LEASE), TBL_WORKER_LEASE & " existiert"
+    AssertIsTrue TabelleExistiert(TBL_WORKER_TRACE), TBL_WORKER_TRACE & " existiert"
 
     AssertIsNotEmpty CacheGetConfig(CFG_WORKER_POLL_MS, ""), CFG_WORKER_POLL_MS & " gesetzt"
     AssertIsNotEmpty CacheGetConfig(CFG_WORKER_HB_S, ""), CFG_WORKER_HB_S & " gesetzt"
@@ -484,15 +495,16 @@ Private Sub Test_CancelHandling()
     Dim strWorker As String
     strWorker = BuildTestWorkerId("CANCEL")
 
-    Dim lngClaimed As Long
-    lngClaimed = ClaimNextJob(strWorker)
-    AssertGreaterThan lngClaimed, 0, "Cancel-Testjob geclaimt oder Queue-Job geclaimt"
-
-    If lngClaimed <> lngJobID Then
-        AssertSkip "Cancel-Test nicht ausgefuehrt: Queue enthielt Fremdjob (Sicherheitsabbruch)"
+    ' Direkter Claim per JobID - Queue-Reihenfolge spielt keine Rolle
+    If Not ClaimJobForTest(lngJobID, strWorker) Then
+        AssertFail "Cancel-Testjob direkt claimbar (JobID=" & lngJobID & ") | Status=" & Nz(DLookup("Status", TBL_SYNC_JOB, "JobID=" & lngJobID), "(fehlt)")
         SuiteEnd
         Exit Sub
     End If
+    AssertAreEqual JOB_STATUS_RUNNING, Nz(DLookup("Status", TBL_SYNC_JOB, "JobID=" & lngJobID), ""), "Cancel-Testjob direkt geclaimt"
+
+    Dim lngClaimed As Long
+    lngClaimed = lngJobID
 
     CurrentDb.Execute "UPDATE [" & TBL_SYNC_CONTROL & "] SET CancelRequested=True, UpdatedAt=" & SQLJetzt() & " WHERE JobID=" & lngClaimed, dbFailOnError
 
@@ -528,14 +540,13 @@ Private Sub Test_FinalizeJob()
     Dim strWorker As String
     strWorker = BuildTestWorkerId("FINAL")
 
-    Dim lngClaimed As Long
-    lngClaimed = ClaimNextJob(strWorker)
-    If lngClaimed <> lngJobID Then
-        AssertSkip "Finalize-Test nicht ausgefuehrt: Queue enthielt Fremdjob (Sicherheitsabbruch)"
+    ' Direkter Claim per JobID - Queue-Reihenfolge spielt keine Rolle
+    If Not ClaimJobForTest(lngJobID, strWorker) Then
+        AssertFail "Finalize-Testjob direkt claimbar (JobID=" & lngJobID & ") | Status=" & Nz(DLookup("Status", TBL_SYNC_JOB, "JobID=" & lngJobID), "(fehlt)")
         SuiteEnd
         Exit Sub
     End If
-    AssertGreaterThan lngClaimed, 0, "Finalize-Testjob geclaimt"
+    AssertAreEqual JOB_STATUS_RUNNING, Nz(DLookup("Status", TBL_SYNC_JOB, "JobID=" & lngJobID), ""), "Finalize-Testjob direkt geclaimt"
 
     FinalizeJob lngJobID, JOB_STATUS_COMPLETED, "", strWorker
 
@@ -596,6 +607,41 @@ Private Sub DeleteJobCascade(ByVal lngJobID As Long)
     On Error GoTo 0
 End Sub
 
+' Claimt einen spezifischen Test-Job direkt per UPDATE (umgeht Queue-Reihenfolge).
+' Verwenden fuer Cancel/Finalize-Tests, damit Fremdjobs in der Queue nicht stören.
+Private Function ClaimJobForTest(ByVal lngJobID As Long, ByVal strWorkerId As String) As Boolean
+    On Error GoTo ErrHandler
+
+    If lngJobID <= 0 Or Len(Trim$(strWorkerId)) = 0 Then Exit Function
+
+    Dim db As DAO.Database
+    Set db = CurrentDb
+
+    db.Execute "UPDATE [" & TBL_SYNC_JOB & "] " & _
+               "SET Status='" & JOB_STATUS_RUNNING & "', " & _
+               "    WorkerId='" & SQLSafe(strWorkerId) & "', " & _
+               "    StartedAt=" & SQLJetzt() & " " & _
+               "WHERE JobID=" & lngJobID & " AND Status='" & JOB_STATUS_QUEUED & "'", _
+               dbFailOnError
+
+    ClaimJobForTest = (db.RecordsAffected = 1)
+
+    If Not ClaimJobForTest Then
+        Debug.Print "[CLAIM-TEST] Kein Claim moeglich | JobID=" & lngJobID & _
+                    " | IstStatus=" & Nz(DLookup("Status", TBL_SYNC_JOB, "JobID=" & lngJobID), "(nicht gefunden)") & _
+                    " | WorkerId=" & strWorkerId
+    End If
+
+    Set db = Nothing
+    Exit Function
+
+ErrHandler:
+    Debug.Print "[CLAIM-TEST] FEHLER | JobID=" & lngJobID & " | Err=" & Err.Number & " - " & Err.Description
+    On Error Resume Next
+    Set db = Nothing
+    ClaimJobForTest = False
+End Function
+
 Private Function BuildTestWorkerId(ByVal strSuffix As String) As String
     BuildTestWorkerId = TEST_PREFIX & strSuffix & "_" & Environ("USERNAME") & "_" & Format$(Now, "hhnnss")
 End Function
@@ -603,17 +649,35 @@ End Function
 Private Function EnsureDualAccessReadyFast() As Boolean
     On Error GoTo Fallback
 
-    If TabelleExistiert(TBL_SYNC_JOB) _
-       And TabelleExistiert(TBL_SYNC_HEARTBEAT) _
-       And TabelleExistiert(TBL_SYNC_CONTROL) _
-       And TabelleExistiert(TBL_WORKER_LEASE) _
-         And WorkerTraceFastReady() _
-       And Len(Nz(CacheGetConfig(CFG_WORKER_POLL_MS, ""), "")) > 0 _
-       And Len(Nz(CacheGetConfig(CFG_WORKER_HB_S, ""), "")) > 0 _
-       And Len(Nz(CacheGetConfig(CFG_WORKER_STALE_S, ""), "")) > 0 Then
+    Dim blnTabellen As Boolean
+    Dim blnConfig As Boolean
+
+    blnTabellen = TabelleExistiert(TBL_SYNC_JOB) _
+                  And TabelleExistiert(TBL_SYNC_HEARTBEAT) _
+                  And TabelleExistiert(TBL_SYNC_CONTROL) _
+                  And TabelleExistiert(TBL_WORKER_LEASE) _
+                  And WorkerTraceFastReady()
+
+    blnConfig = Len(Nz(CacheGetConfig(CFG_WORKER_POLL_MS, ""), "")) > 0 _
+                And Len(Nz(CacheGetConfig(CFG_WORKER_HB_S, ""), "")) > 0 _
+                And Len(Nz(CacheGetConfig(CFG_WORKER_STALE_S, ""), "")) > 0
+
+    If blnTabellen And blnConfig Then
         Debug.Print "[SETUP] Skip Migration: Dual-Access bereits bereit"
         EnsureDualAccessReadyFast = True
         Exit Function
+    End If
+
+    If Not blnTabellen Then
+        Debug.Print "[SETUP] Tabellen/Trace unvollstaendig - Migration wird ausgefuehrt"
+        Debug.Print "[SETUP] " & TBL_SYNC_JOB & ": " & IIf(TabelleExistiert(TBL_SYNC_JOB), "OK", "FEHLT")
+        Debug.Print "[SETUP] " & TBL_SYNC_HEARTBEAT & ": " & IIf(TabelleExistiert(TBL_SYNC_HEARTBEAT), "OK", "FEHLT")
+        Debug.Print "[SETUP] " & TBL_SYNC_CONTROL & ": " & IIf(TabelleExistiert(TBL_SYNC_CONTROL), "OK", "FEHLT")
+        Debug.Print "[SETUP] " & TBL_WORKER_LEASE & ": " & IIf(TabelleExistiert(TBL_WORKER_LEASE), "OK", "FEHLT")
+        Debug.Print "[SETUP] " & TBL_WORKER_TRACE & ": " & IIf(TabelleExistiert(TBL_WORKER_TRACE), "OK", "FEHLT")
+    End If
+    If Not blnConfig Then
+        Debug.Print "[SETUP] Worker-Config unvollstaendig - Migration wird ausgefuehrt"
     End If
 
 Fallback:
@@ -633,7 +697,10 @@ Private Function WorkerTraceFastReady() As Boolean
         Exit Function
     End If
 
-    If Not TabelleExistiert(TBL_WORKER_TRACE) Then Exit Function
+    If Not TabelleExistiert(TBL_WORKER_TRACE) Then
+        Debug.Print "[TRACE-READY] " & TBL_WORKER_TRACE & " fehlt im Frontend-Linked-Table"
+        Exit Function
+    End If
 
     Set db = DBEngine.OpenDatabase(strBackendPfad)
     For Each td In db.TableDefs
@@ -643,12 +710,17 @@ Private Function WorkerTraceFastReady() As Boolean
         End If
     Next td
 
+    If Not WorkerTraceFastReady Then
+        Debug.Print "[TRACE-READY] " & TBL_WORKER_TRACE & " fehlt in Backend: " & strBackendPfad
+    End If
+
     db.Close
     Set db = Nothing
     Set td = Nothing
     Exit Function
 
 ErrHandler:
+    Debug.Print "[TRACE-READY] FEHLER | Backend=" & strBackendPfad & " | Err=" & Err.Number & " - " & Err.Description
     On Error Resume Next
     If Not db Is Nothing Then db.Close
     Set db = Nothing
