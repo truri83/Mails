@@ -27,7 +27,7 @@ Option Explicit
 '   SchemaCheck        - Schema-Version pruefen + Warnung
 '
 ' Abhaengigkeiten: modGlobals (Konstanten), modLogging (Log-Funktionen),
-'                  modSchema (LeseConfig, TabelleExistiert)
+'                  modSchemaTools (TabelleExistiert), modCache (CacheGetConfig)
 ' ===========================================================================
 
 

@@ -41,7 +41,7 @@ Option Explicit
 ' ABHAENGIGKEITEN: modLogging (LogInfo, LogWarn, LogDebug)
 ' ===========================================================================
 
-Private Const MOD_NAME As String = "modDDL"
+Private Const MODUL_NAME As String = "modDDL"
 
 
 ' ===========================================================================
@@ -122,18 +122,18 @@ End Function
 ' Fuer lokale FE-Tabellen: Erstellung via CurrentDb.
 Public Function DDL_ErstelleTabelle(ByVal strTabelle As String, ByVal strSQL As String) As Boolean
     If DDL_TabelleExistiert(strTabelle) Then
-        LogDebug "  [SKIP] " & strTabelle & " (existiert bereits)", MOD_NAME
+        LogDebug "  [SKIP] " & strTabelle & " (existiert bereits)", MODUL_NAME
         DDL_ErstelleTabelle = False
         Exit Function
     End If
 
     On Error GoTo ErrHandler
     CurrentDb.Execute strSQL
-    LogDebug "  [OK  ] " & strTabelle & " erstellt", MOD_NAME
+    LogDebug "  [OK  ] " & strTabelle & " erstellt", MODUL_NAME
     DDL_ErstelleTabelle = True
     Exit Function
 ErrHandler:
-    LogWarn "  [FAIL] " & strTabelle & " - " & Err.Description, MOD_NAME
+    LogWarn "  [FAIL] " & strTabelle & " - " & Err.Description, MODUL_NAME
     DDL_ErstelleTabelle = False
 End Function
 
@@ -170,11 +170,11 @@ Public Function DDL_LoescheTabelle(ByVal strTabelle As String) As Boolean
     End If
 
     Set db = Nothing
-    LogDebug "  [DROP] " & strTabelle, MOD_NAME
+    LogDebug "  [DROP] " & strTabelle, MODUL_NAME
     DDL_LoescheTabelle = True
     Exit Function
 ErrHandler:
-    LogWarn "  [FAIL] DROP " & strTabelle & " - " & Err.Description, MOD_NAME
+    LogWarn "  [FAIL] DROP " & strTabelle & " - " & Err.Description, MODUL_NAME
     DDL_LoescheTabelle = False
 End Function
 
@@ -192,7 +192,7 @@ Public Sub DDL_SichereSpalte(ByVal strTabelle As String, ByVal strFeld As String
     strSQL = "ALTER TABLE [" & strTabelle & "] ADD COLUMN [" & strFeld & "] " & strTypSQL
 
     If DDL_Ausfuehren(strTabelle, strSQL) Then
-        LogDebug "  [+FLD] " & strTabelle & "." & strFeld, MOD_NAME
+        LogDebug "  [+FLD] " & strTabelle & "." & strFeld, MODUL_NAME
     End If
 End Sub
 
@@ -221,11 +221,11 @@ Public Sub DDL_SetzeFeldDefault(ByVal strTabelle As String, ByVal strFeld As Str
         RefreshTableLink strTabelle
     End If
 
-    LogDebug "  [DFLT] " & strTabelle & "." & strFeld & " = " & strDefault, MOD_NAME
+    LogDebug "  [DFLT] " & strTabelle & "." & strFeld & " = " & strDefault, MODUL_NAME
     Exit Sub
 ErrHandler:
     If bMussSchliessen And Not dbTarget Is Nothing Then dbTarget.Close
-    LogWarn "  [WARN] Default " & strTabelle & "." & strFeld & " - " & Err.Description, MOD_NAME
+    LogWarn "  [WARN] Default " & strTabelle & "." & strFeld & " - " & Err.Description, MODUL_NAME
 End Sub
 
 ' Stellt sicher dass ein YESNO-Feld existiert und Default 0 (Nein) hat
@@ -267,7 +267,7 @@ Public Sub DDL_SichererIndex(ByVal strTabelle As String, ByVal strIndex As Strin
     End If
 
     If DDL_Ausfuehren(strTabelle, strSQL) Then
-        LogDebug "  [+IDX] " & strIndex & " ON " & strTabelle, MOD_NAME
+        LogDebug "  [+IDX] " & strIndex & " ON " & strTabelle, MODUL_NAME
     End If
 End Sub
 
@@ -287,7 +287,7 @@ Public Function DDL_Ausfuehren(ByVal strTabelle As String, ByVal strSQL As Strin
         Dim strPfad As String
         strPfad = HoleBackendPfad(strTabelle)
         If Len(strPfad) = 0 Then
-            LogWarn "Backend-Pfad nicht ermittelbar fuer " & strTabelle, MOD_NAME
+            LogWarn "Backend-Pfad nicht ermittelbar fuer " & strTabelle, MODUL_NAME
             DDL_Ausfuehren = False
             Exit Function
         End If
@@ -315,7 +315,7 @@ ErrHandler:
         Case 3376  ' Table already exists
             DDL_Ausfuehren = False
         Case Else
-            LogWarn "DDL-Fehler " & Err.Number & ": " & Err.Description & " | SQL: " & Left$(strSQL, 200), MOD_NAME
+            LogWarn "DDL-Fehler " & Err.Number & ": " & Err.Description & " | SQL: " & Left$(strSQL, 200), MODUL_NAME
             DDL_Ausfuehren = False
     End Select
 End Function

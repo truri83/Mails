@@ -16,7 +16,8 @@ Option Explicit
 '   modOutlookConnect  (ConnectOutlook, ConnectRDO, g_objOutlook)
 '   modDAO             (SpeichereOrdner)
 '   modGlobals         (g_objOutlook, g_blnAbbrechen)
-'   modLogging         (LogInfo, LogWarn, LogError, LogVBAError)
+'   modLogging         (LogInfo, LogWarn, LogError)
+'   modDevUtils        (HandleError)
 ' ===========================================================================
 
 

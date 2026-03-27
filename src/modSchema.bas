@@ -1358,19 +1358,6 @@ Private Sub SetzeDefaultWert(db As DAO.Database, ByVal strTabelle As String, _
 End Sub
 
 
-' Prueft ob eine Tabelle in der Datenbank existiert (modul-intern)
-' Oeffentliche Version: modSchemaTools.TabelleExistiert
-Private Function TabelleExistiert(ByVal strName As String) As Boolean
-    Dim td As DAO.TableDef
-    TabelleExistiert = False
-    For Each td In CurrentDb.TableDefs
-        If td.Name = strName Then
-            TabelleExistiert = True
-            Exit For
-        End If
-    Next td
-End Function
-
 
 ' Prueft ob eine Tabelle in einer beliebigen DB existiert (nicht nur CurrentDb)
 ' Wird von ErstelleBackendTabellenInDB benoetigt (db kann externe DB sein)

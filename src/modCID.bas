@@ -18,8 +18,8 @@ Option Explicit
 '   BaueCIDSchluessel()          - CID-Key-Varianten erzeugen
 '
 ' Abhaengigkeiten:
-'   modStringUtils  (BereinigeAnhangName)
-'   modLogging      (LogInfo, LogDebug, LogWarn, LogVBAError)
+'   modLogging      (LogInfo, LogDebug, LogWarn)
+'   modDevUtils     (HandleError)
 ' ===========================================================================
 
 

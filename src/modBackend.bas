@@ -34,7 +34,8 @@ Option Explicit
 '   BackendOptimierTimeouts   ' Bei Init aufrufen!
 '   StartBackendWatchdog       ' Periodische Pruefung starten
 '
-' Abhaengigkeiten: modSchema (TabelleExistiert, ErstelleAlleTabellen),
+' Abhaengigkeiten: modSchema (ErstelleAlleTabellen),
+'                  modSchemaTools (TabelleExistiert),
 '                  modStringUtils (NormalisierePfad, ErstelleOrdner),
 '                  modLogging
 ' ===========================================================================
