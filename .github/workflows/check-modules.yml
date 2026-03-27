@@ -1,0 +1,32 @@
+name: Check Modules for Contradictions
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  check-modules:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v3
+
+    - name: Set up Python
+      uses: actions/setup-python@v4
+      with:
+        python-version: '3.x'
+
+    - name: Check modules for contradictions
+      run: |
+        python3 check_modules.py
+
+    - name: Check exit status
+      run: |
+        if [ $? -eq 0 ]; then
+          echo "✅ All modules passed contradiction checks!"
+        else
+          echo "❌ Module contradictions detected!"
+          exit 1
+        fi
