@@ -1,0 +1,2371 @@
+Option Compare Database
+Option Explicit
+
+' ===========================================================================
+' modTestPerformance - Performance-Tests fuer Architektur-Entscheidungen
+' ===========================================================================
+' Testet systematisch alle Performance-relevanten Aspekte:
+'
+'   BEREICH 1: DB-WRITE Performance (Netzwerk-Backend)
+'     - Linked Tables: Batch-Groessen 1/10/25/50/100 (mit Transaktion)
+'     - Direct DAO.OpenDatabase: Gleiche Batch-Groessen
+'     - Schreibmethoden: Recordset.AddNew vs Execute INSERT vs QueryDef
+'     - Memo-Feld-Performance (1KB / 50KB / 500KB HTML Body)
+'
+'   BEREICH 2: DB-READ Performance (Hash-Lookup, DLookup)
+'     - Batch-Hash-Pruefung per SELECT ... WHERE Hash IN (...)
+'     - DLookup vs Recordset-Lookup vs DCount
+'
+'   BEREICH 3: OUTLOOK-EXTRAKTION (OOM vs Redemption)
+'     - OOM Basic (Subject, Date, Size - kein Security Issue)
+'     - OOM + Body/HTML (grosse Properties)
+'     - Redemption SafeMailItem (alle Felder, kein Security Prompt)
+'     - Redemption RDO (direkter MAPI-Zugriff)
+'     - Extract-Release Timing (COM-Haltezeit messen)
+'
+'   BEREICH 4: SHA256-HASHING
+'     - CryptoAPI Durchsatz (verschiedene Eingabegroessen)
+'
+' AUFRUF IM DIREKTFENSTER:
+'   TestAllePerformance "\\Server\Share\Pfad\"
+'   TestAllePerformance "\\Server\Share\Pfad\", 100    ' 100 Test-Records
+'
+' EINZELTESTS:
+'   TestDBPerformance "\\Server\Share\Pfad\"            ' Nur DB
+'   TestOutlookExtraktion                               ' Nur Outlook
+'   TestOutlookExtraktion 100                           ' 100 Mails testen
+'   TestSyncLasttest "Postfach\\Ordner"                    ' End-to-End Sync Lasttest
+'   TestSyncLasttest "Postfach\\Ordner", 5, 300, 8, True  ' 5 Laeufe, 300 Mails, 8s Pause
+'   TestHashingSpeed                                    ' Nur SHA256
+'
+' Abhaengigkeiten: Keine (komplett eigenstaendig)
+' ===========================================================================
+
+
+' ---------------------------------------------------------------------------
+' WINDOWS API DEKLARATIONEN
+' ---------------------------------------------------------------------------
+#If VBA7 Then
+    Private Declare PtrSafe Function GetTickCount Lib "kernel32" () As Long
+    Private Declare PtrSafe Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+    ' High-Resolution Timer (Sub-Millisekunde)
+    Private Declare PtrSafe Function QueryPerformanceCounter Lib "kernel32" _
+        (lpPerformanceCount As Currency) As Long
+    Private Declare PtrSafe Function QueryPerformanceFrequency Lib "kernel32" _
+        (lpFrequency As Currency) As Long
+
+    ' CryptoAPI fuer SHA256
+    Private Declare PtrSafe Function CryptAcquireContext Lib "advapi32.dll" _
+        Alias "CryptAcquireContextA" _
+        (ByRef phProv As LongPtr, ByVal pszContainer As String, _
+         ByVal pszProvider As String, ByVal dwProvType As Long, _
+         ByVal dwFlags As Long) As Long
+    Private Declare PtrSafe Function CryptCreateHash Lib "advapi32.dll" _
+        (ByVal hProv As LongPtr, ByVal Algid As Long, ByVal hKey As LongPtr, _
+         ByVal dwFlags As Long, ByRef phHash As LongPtr) As Long
+    Private Declare PtrSafe Function CryptHashData Lib "advapi32.dll" _
+        (ByVal hHash As LongPtr, ByRef pbData As Byte, ByVal dwDataLen As Long, _
+         ByVal dwFlags As Long) As Long
+    Private Declare PtrSafe Function CryptGetHashParam Lib "advapi32.dll" _
+        (ByVal hHash As LongPtr, ByVal dwParam As Long, ByRef pbData As Byte, _
+         ByRef pdwDataLen As Long, ByVal dwFlags As Long) As Long
+    Private Declare PtrSafe Function CryptDestroyHash Lib "advapi32.dll" _
+        (ByVal hHash As LongPtr) As Long
+    Private Declare PtrSafe Function CryptReleaseContext Lib "advapi32.dll" _
+        (ByVal hProv As LongPtr, ByVal dwFlags As Long) As Long
+#Else
+    Private Declare Function GetTickCount Lib "kernel32" () As Long
+    Private Declare Sub Sleep Lib "kernel32" (ByVal dwMilliseconds As Long)
+
+    Private Declare Function QueryPerformanceCounter Lib "kernel32" _
+        (lpPerformanceCount As Currency) As Long
+    Private Declare Function QueryPerformanceFrequency Lib "kernel32" _
+        (lpFrequency As Currency) As Long
+
+    Private Declare Function CryptAcquireContext Lib "advapi32.dll" _
+        Alias "CryptAcquireContextA" _
+        (ByRef phProv As Long, ByVal pszContainer As String, _
+         ByVal pszProvider As String, ByVal dwProvType As Long, _
+         ByVal dwFlags As Long) As Long
+    Private Declare Function CryptCreateHash Lib "advapi32.dll" _
+        (ByVal hProv As Long, ByVal Algid As Long, ByVal hKey As Long, _
+         ByVal dwFlags As Long, ByRef phHash As Long) As Long
+    Private Declare Function CryptHashData Lib "advapi32.dll" _
+        (ByVal hHash As Long, ByRef pbData As Byte, ByVal dwDataLen As Long, _
+         ByVal dwFlags As Long) As Long
+    Private Declare Function CryptGetHashParam Lib "advapi32.dll" _
+        (ByVal hHash As Long, ByVal dwParam As Long, ByRef pbData As Byte, _
+         ByRef pdwDataLen As Long, ByVal dwFlags As Long) As Long
+    Private Declare Function CryptDestroyHash Lib "advapi32.dll" _
+        (ByVal hHash As Long) As Long
+    Private Declare Function CryptReleaseContext Lib "advapi32.dll" _
+        (ByVal hProv As Long, ByVal dwFlags As Long) As Long
+#End If
+
+' CryptoAPI Konstanten
+Private Const PROV_RSA_AES          As Long = 24
+Private Const CRYPT_VERIFYCONTEXT   As Long = &HF0000000
+Private Const CALG_SHA_256          As Long = &H800C
+Private Const HP_HASHVAL            As Long = 2
+
+
+' ---------------------------------------------------------------------------
+' MODUL-VARIABLEN
+' ---------------------------------------------------------------------------
+Private m_strNetzwerkPfad   As String   ' Netzwerk-Basispfad (User-Eingabe)
+Private m_strTestDBPfad     As String   ' Voller Pfad zur Test-Backend-DB
+Private m_lngAnzahlRecords  As Long     ' Anzahl Test-Records pro Test
+Private m_curFrequency      As Currency ' QPC Frequenz fuer Zeitmessung
+Private m_lngBaselineLinked As Long     ' Baseline-Zeit Linked Tables (ohne Trans)
+Private m_lngBaselineDirect As Long     ' Baseline-Zeit Direct DAO (ohne Trans)
+Private m_lngLetzteHashZeit As Long     ' Letzte Hash-Benchmark-Zeit (fuer Bewertung)
+
+
+' ===========================================================================
+' SICHERHEITS-HELFER: Offene Transaktionen bereinigen
+' ===========================================================================
+
+' Rollt alle offenen DAO-Transaktionen sicher zurueck.
+' Verhindert Kaskadierfehler zwischen Test-Sektionen.
+' Inspiriert von mdl_Transaction_Manager.ForceCleanup.
+Private Sub SichereRollback()
+    On Error Resume Next
+    Dim i As Integer
+    For i = 1 To 10  ' Sicherheitsbremse
+        DBEngine.Workspaces(0).Rollback
+        If Err.Number <> 0 Then
+            Err.Clear
+            Exit For  ' Keine offenen Transaktionen mehr (Error 3034)
+        End If
+    Next i
+    On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
+' HAUPT-EINSTIEGSPUNKT
+' ===========================================================================
+
+' Alle Performance-Tests durchfuehren.
+'   strNetzwerkPfad: Netzlaufwerk-Pfad fuer DB-Tests (Pflicht fuer DB-Tests)
+'   lngAnzahlRecords: Anzahl Test-Records (Standard: 100)
+Public Sub TestAllePerformance(Optional ByVal strNetzwerkPfad As String = "", _
+                                Optional ByVal lngAnzahlRecords As Long = 100)
+    On Error GoTo ErrHandler
+
+    ' QPC Frequenz initialisieren
+    QueryPerformanceFrequency m_curFrequency
+
+    Debug.Print String(80, "=")
+    Debug.Print "  PERFORMANCE-TESTS FUER ARCHITEKTUR-ENTSCHEIDUNGEN"
+    Debug.Print String(80, "=")
+    Debug.Print "  Zeitpunkt   : " & Now()
+#If VBA7 Then
+    Debug.Print "  VBA7/64-Bit : Ja"
+#Else
+    Debug.Print "  VBA7/64-Bit : Nein"
+#End If
+    Debug.Print "  QPC Freq    : " & Format(m_curFrequency * 10000, "#,##0") & " Hz"
+    Debug.Print String(80, "=")
+    Debug.Print ""
+
+    ' --- BEREICH 1+2: DB-Performance ---
+    If strNetzwerkPfad <> "" Then
+        TestDBPerformance strNetzwerkPfad, lngAnzahlRecords
+    Else
+        Debug.Print "*** DB-Tests uebersprungen (kein Netzwerkpfad angegeben)"
+        Debug.Print "    Aufruf mit: TestAllePerformance ""\\Server\Share\Pfad\"""
+        Debug.Print ""
+    End If
+
+    ' --- BEREICH 3: Outlook-Extraktion ---
+    Debug.Print ""
+    TestOutlookExtraktion 50
+
+    ' --- BEREICH 4: SHA256-Hashing ---
+    Debug.Print ""
+    TestHashingSpeed
+
+    ' --- ZUSAMMENFASSUNG ---
+    Debug.Print ""
+    Debug.Print String(80, "=")
+    Debug.Print "  ALLE TESTS ABGESCHLOSSEN - " & Now()
+    Debug.Print String(80, "=")
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "*** FEHLER in TestAllePerformance: " & Err.Description
+End Sub
+
+
+' ===========================================================================
+' BEREICH 1+2: DATENBANK-PERFORMANCE
+' ===========================================================================
+
+' Hauptroutine fuer alle DB-Performance-Tests
+Public Sub TestDBPerformance(Optional ByVal strNetzwerkPfad As String = "", _
+                              Optional ByVal lngAnzahlRecords As Long = 100)
+    On Error GoTo ErrHandler
+
+    ' QPC Frequenz initialisieren (falls Einzelaufruf)
+    QueryPerformanceFrequency m_curFrequency
+
+    ' Pfad validieren
+    If strNetzwerkPfad = "" Then
+        Debug.Print "*** FEHLER: Netzwerkpfad erforderlich!"
+        Debug.Print "    Aufruf: TestDBPerformance ""\\Server\Share\Pfad\"""
+        Exit Sub
+    End If
+
+    m_strNetzwerkPfad = strNetzwerkPfad
+    If Right(m_strNetzwerkPfad, 1) <> "\" Then m_strNetzwerkPfad = m_strNetzwerkPfad & "\"
+
+    m_lngAnzahlRecords = lngAnzahlRecords
+    If m_lngAnzahlRecords < 10 Then m_lngAnzahlRecords = 10
+    If m_lngAnzahlRecords > 1000 Then m_lngAnzahlRecords = 1000
+
+    Debug.Print String(80, "=")
+    Debug.Print "  DATENBANK-PERFORMANCE TESTS"
+    Debug.Print String(80, "=")
+    Debug.Print "  Netzwerkpfad : " & m_strNetzwerkPfad
+    Debug.Print "  Test-Records : " & m_lngAnzahlRecords
+    Debug.Print ""
+
+    ' --- Schritt 1: Test-Backend erstellen ---
+    Debug.Print "Erstelle Test-Backend auf Netzwerk..."
+    If Not ErstelleTestBackend() Then
+        Debug.Print "*** FEHLER: Test-Backend konnte nicht erstellt werden! Abbruch."
+        Exit Sub
+    End If
+    Debug.Print "  -> " & m_strTestDBPfad
+    Debug.Print ""
+
+    ' --- Schritt 2: Netzwerk-Baseline (rohe I/O ohne DB) ---
+    TestNetzwerkBaseline
+    Debug.Print ""
+
+    ' --- Schritt 3: Linked Table Tests ---
+    Debug.Print "Verknuepfe Test-Tabellen..."
+    If VerknuepeTestTabellen() Then
+        Debug.Print ""
+        TestBatchSchreiben_Linked
+        SichereRollback  ' Sicherheit: offene Transaktionen bereinigen
+        Debug.Print ""
+        TestSchreibMethoden_Linked
+        SichereRollback
+    Else
+        Debug.Print "*** Linked-Table-Tests uebersprungen (Verknuepfung fehlgeschlagen)"
+    End If
+
+    ' Verknuepfungen wieder entfernen
+    SichereRollback
+    EntferneTestVerknuepfungen
+    Debug.Print ""
+
+    ' --- Schritt 4: Direct DAO Tests ---
+    TestBatchSchreiben_Direct
+    SichereRollback
+    Debug.Print ""
+
+    ' --- Schritt 5: Memo-Feld Tests ---
+    TestMemoSchreiben
+    SichereRollback
+    Debug.Print ""
+
+    ' --- Schritt 6: Hash-Lookup Tests ---
+    TestHashLookup
+    Debug.Print ""
+
+    ' --- Schritt 6: Ergebnis-Tabelle ---
+    ' (wird innerhalb jedes Tests bereits ausgegeben)
+
+    ' --- Aufraeumen ---
+    Debug.Print "Loesche Test-Backend..."
+    LoescheTestBackend
+    Debug.Print "DB-Tests abgeschlossen."
+    Debug.Print String(80, "=")
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "*** FEHLER in TestDBPerformance: " & Err.Description
+    On Error Resume Next
+    EntferneTestVerknuepfungen
+    LoescheTestBackend
+    On Error GoTo 0
+End Sub
+
+
+' ---------------------------------------------------------------------------
+' NETZWERK-BASELINE (rohe I/O-Performance ohne DB)
+' ---------------------------------------------------------------------------
+' Misst die Roh-Performance des Netzwerkpfads:
+'   - Datei-Latenz: Erstellen/Loeschen (Roundtrip zum Server)
+'   - Schreib-Durchsatz: 1 MB sequentiell schreiben
+'   - Lese-Durchsatz: 1 MB lesen
+'   - Verzeichnis-Latenz: Dir()-Aufrufe
+' Gibt Kontext fuer die DB-Testergebnisse.
+Private Sub TestNetzwerkBaseline()
+    On Error GoTo ErrHandler
+
+    Debug.Print "--- NETZWERK-BASELINE (rohe I/O, kein DB-Zugriff) ---"
+    Debug.Print ""
+
+    Dim strTestFile As String
+    Dim t1 As Long, t2 As Long
+    Dim ff As Integer
+    Dim i As Long
+
+    ' ---- Test 1: Datei-Latenz (Create + Close + Delete) ----
+    Debug.Print "  Latenz-Test (10x Datei erstellen/loeschen)..."
+    strTestFile = m_strNetzwerkPfad & "perftest_latenz.tmp"
+
+    t1 = GetTickCount()
+    For i = 1 To 10
+        ff = FreeFile
+        Open strTestFile For Output As #ff
+        Print #ff, "latenztest"
+        Close #ff
+        Kill strTestFile
+    Next i
+    t2 = GetTickCount()
+
+    Dim lngLatenz As Long: lngLatenz = t2 - t1
+    Debug.Print "    10x Create+Write+Close+Delete: " & FormatMS(lngLatenz) & _
+                " (" & FormatProRec(lngLatenz, 10) & " pro Durchgang)"
+
+    ' ---- Test 2: Schreib-Durchsatz (1 MB) ----
+    Debug.Print "  Schreib-Test (1 MB in 64KB-Bloecken)..."
+    strTestFile = m_strNetzwerkPfad & "perftest_write.tmp"
+
+    Dim strBlock As String
+    strBlock = String(65536, "X")  ' 64 KB Textblock
+
+    t1 = GetTickCount()
+    ff = FreeFile
+    Open strTestFile For Output As #ff
+    For i = 1 To 16  ' 16 x 64KB = 1MB
+        Print #ff, strBlock
+    Next i
+    Close #ff
+    t2 = GetTickCount()
+
+    Dim lngSchreiben As Long: lngSchreiben = t2 - t1
+    Dim dblSchreibMBs As Double
+    If lngSchreiben > 0 Then
+        dblSchreibMBs = 1000# / CDbl(lngSchreiben)
+    End If
+    Debug.Print "    1 MB schreiben: " & FormatMS(lngSchreiben) & _
+                " (" & Format(dblSchreibMBs, "0.0") & " MB/s)"
+
+    ' ---- Test 3: Lese-Durchsatz (1 MB) ----
+    Debug.Print "  Lese-Test (1 MB lesen)..."
+    Dim strTemp As String
+
+    t1 = GetTickCount()
+    ff = FreeFile
+    Open strTestFile For Input As #ff
+    Do While Not EOF(ff)
+        Line Input #ff, strTemp
+    Loop
+    Close #ff
+    t2 = GetTickCount()
+
+    Dim lngLesen As Long: lngLesen = t2 - t1
+    Dim dblLeseMBs As Double
+    If lngLesen > 0 Then
+        dblLeseMBs = 1000# / CDbl(lngLesen)
+    End If
+    Debug.Print "    1 MB lesen: " & FormatMS(lngLesen) & _
+                " (" & Format(dblLeseMBs, "0.0") & " MB/s)"
+
+    ' Testdatei loeschen
+    On Error Resume Next
+    Kill strTestFile
+    On Error GoTo ErrHandler
+
+    ' ---- Test 4: Verzeichnis-Latenz (Dir) ----
+    Debug.Print "  Verzeichnis-Abfrage (10x Dir)..."
+    Dim strDummy As String
+
+    t1 = GetTickCount()
+    For i = 1 To 10
+        strDummy = Dir(m_strNetzwerkPfad & "*.*")
+    Next i
+    t2 = GetTickCount()
+
+    Dim lngDir As Long: lngDir = t2 - t1
+    Debug.Print "    10x Dir(): " & FormatMS(lngDir) & _
+                " (" & FormatProRec(lngDir, 10) & " pro Abfrage)"
+
+    Debug.Print ""
+    Debug.Print "  ZUSAMMENFASSUNG Netzwerk-Baseline:"
+    Debug.Print "    Dateioperation-Latenz : " & FormatProRec(lngLatenz, 10) & " pro Roundtrip"
+    If dblSchreibMBs > 0 Then
+        Debug.Print "    Schreib-Durchsatz     : " & Format(dblSchreibMBs, "0.0") & " MB/s"
+    End If
+    If dblLeseMBs > 0 Then
+        Debug.Print "    Lese-Durchsatz        : " & Format(dblLeseMBs, "0.0") & " MB/s"
+    End If
+    Debug.Print "    Verzeichnis-Latenz    : " & FormatProRec(lngDir, 10) & " pro Dir()"
+    Debug.Print ""
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "  FEHLER: " & Err.Description
+    On Error Resume Next
+    Kill m_strNetzwerkPfad & "perftest_latenz.tmp"
+    Kill m_strNetzwerkPfad & "perftest_write.tmp"
+    On Error GoTo 0
+End Sub
+
+
+' ---------------------------------------------------------------------------
+' TEST-BACKEND ERSTELLEN (temporaere .accdb auf Netzwerk)
+' ---------------------------------------------------------------------------
+Private Function ErstelleTestBackend() As Boolean
+    On Error GoTo ErrHandler
+
+    m_strTestDBPfad = m_strNetzwerkPfad & "PerfTest_" & _
+                      Format(Now, "yyyymmdd_hhnnss") & ".accdb"
+
+    ' Datenbank erstellen
+    Dim ws As DAO.Workspace
+    Dim dbBE As DAO.Database
+
+    Set ws = DBEngine.Workspaces(0)
+    Set dbBE = ws.CreateDatabase(m_strTestDBPfad, dbLangGeneral)
+
+    ' --- Tabelle: tblTestEmails (simuliert tblEmails) ---
+    dbBE.Execute "CREATE TABLE tblTestEmails (" & _
+        "ID AUTOINCREMENT PRIMARY KEY, " & _
+        "Hash TEXT(64), " & _
+        "Betreff TEXT(255), " & _
+        "Absender TEXT(255), " & _
+        "AbsenderEmail TEXT(255), " & _
+        "DatumGesendet DATETIME, " & _
+        "DatumEmpfangen DATETIME, " & _
+        "Groesse LONG, " & _
+        "AnhangAnzahl INTEGER, " & _
+        "OrdnerID LONG, " & _
+        "SyncLaufID LONG, " & _
+        "ErstelltAm DATETIME)"
+
+    ' Index auf Hash (fuer Duplikatpruefung)
+    dbBE.Execute "CREATE INDEX idxHash ON tblTestEmails (Hash)"
+
+    ' --- Tabelle: tblTestContent (simuliert tblEmailContent mit Memo) ---
+    dbBE.Execute "CREATE TABLE tblTestContent (" & _
+        "ID AUTOINCREMENT PRIMARY KEY, " & _
+        "EmailID LONG, " & _
+        "BodyHTML MEMO, " & _
+        "BodyPlain MEMO, " & _
+        "ErstelltAm DATETIME)"
+
+    ' --- Tabelle: tblTestEmpfaenger (simuliert tblEmailEmpfaenger) ---
+    dbBE.Execute "CREATE TABLE tblTestEmpfaenger (" & _
+        "ID AUTOINCREMENT PRIMARY KEY, " & _
+        "EmailID LONG, " & _
+        "Typ TEXT(10), " & _
+        "EmpfName TEXT(255), " & _
+        "EmpfEmail TEXT(255))"
+
+    dbBE.Close
+    Set dbBE = Nothing
+    Set ws = Nothing
+
+    ErstelleTestBackend = True
+    Exit Function
+
+ErrHandler:
+    Debug.Print "  ErstelleTestBackend FEHLER: " & Err.Description
+    ErstelleTestBackend = False
+End Function
+
+
+' ---------------------------------------------------------------------------
+' TEST-TABELLEN VERKNUEPFEN (fuer Linked-Table-Tests)
+' ---------------------------------------------------------------------------
+Private Function VerknuepeTestTabellen() As Boolean
+    On Error GoTo ErrHandler
+
+    Dim db As DAO.Database
+    Dim td As DAO.TableDef
+
+    Set db = CurrentDb
+
+    ' tblPerfTest_Emails -> tblTestEmails
+    Set td = db.CreateTableDef("tblPerfTest_Emails")
+    td.Connect = ";DATABASE=" & m_strTestDBPfad
+    td.SourceTableName = "tblTestEmails"
+    db.TableDefs.Append td
+
+    ' tblPerfTest_Content -> tblTestContent
+    Set td = db.CreateTableDef("tblPerfTest_Content")
+    td.Connect = ";DATABASE=" & m_strTestDBPfad
+    td.SourceTableName = "tblTestContent"
+    db.TableDefs.Append td
+
+    ' tblPerfTest_Empfaenger -> tblTestEmpfaenger
+    Set td = db.CreateTableDef("tblPerfTest_Empfaenger")
+    td.Connect = ";DATABASE=" & m_strTestDBPfad
+    td.SourceTableName = "tblTestEmpfaenger"
+    db.TableDefs.Append td
+
+    db.TableDefs.Refresh
+    Set db = Nothing
+
+    Debug.Print "  -> 3 Tabellen verknuepft (tblPerfTest_*)"
+    VerknuepeTestTabellen = True
+    Exit Function
+
+ErrHandler:
+    Debug.Print "  VerknuepeTestTabellen FEHLER: " & Err.Description
+    VerknuepeTestTabellen = False
+End Function
+
+
+' ---------------------------------------------------------------------------
+' TEST-VERKNUEPFUNGEN ENTFERNEN
+' ---------------------------------------------------------------------------
+Private Sub EntferneTestVerknuepfungen()
+    On Error Resume Next
+    Dim db As DAO.Database
+    Set db = CurrentDb
+
+    db.TableDefs.Delete "tblPerfTest_Emails"
+    db.TableDefs.Delete "tblPerfTest_Content"
+    db.TableDefs.Delete "tblPerfTest_Empfaenger"
+    db.TableDefs.Refresh
+
+    Set db = Nothing
+    On Error GoTo 0
+End Sub
+
+
+' ---------------------------------------------------------------------------
+' TEST: Batch-Schreiben ueber LINKED TABLES (verschiedene Batch-Groessen)
+' ---------------------------------------------------------------------------
+Private Sub TestBatchSchreiben_Linked()
+    On Error GoTo ErrHandler
+
+    Debug.Print "--- LINKED TABLE WRITES (je EINE Transaktion pro Test) ---"
+    Debug.Print "    (Kein Cycling: jeder Test = 1x BeginTrans ... CommitTrans)"
+    Debug.Print ""
+    Debug.Print PadR("Methode", 16) & PadR("Records", 10) & _
+                PadR("Zeit", 12) & PadR("Pro Record", 12) & "vs Baseline"
+    Debug.Print String(62, "-")
+
+    m_lngBaselineLinked = 0
+
+    ' Baseline: Ohne Transaktion (schreibt m_lngAnzahlRecords)
+    RunBatchWriteTest_Linked m_lngAnzahlRecords, False
+
+    ' Einzelne Transaktionen verschiedener Groesse
+    RunBatchWriteTest_Linked 10, True
+    RunBatchWriteTest_Linked 25, True
+    RunBatchWriteTest_Linked 50, True
+    RunBatchWriteTest_Linked 100, True
+
+    Debug.Print String(62, "-")
+    Debug.Print ""
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "  FEHLER: " & Err.Description
+End Sub
+
+
+' Einzelner Write-Test ueber Linked Table (EINE Transaktion, kein Cycling)
+' lngAnzahl: Anzahl Records die geschrieben werden
+' blnTransaction: True = in BeginTrans/CommitTrans wrappen
+Private Function RunBatchWriteTest_Linked(ByVal lngAnzahl As Long, _
+                                           ByVal blnTransaction As Boolean) As Long
+    On Error GoTo ErrHandler
+
+    Dim db As DAO.Database
+    Dim ws As DAO.Workspace
+    Dim rs As DAO.Recordset
+    Dim t1 As Long, t2 As Long
+    Dim n As Long
+    Dim blnTransOpen As Boolean: blnTransOpen = False
+
+    Set db = CurrentDb
+    Set ws = DBEngine.Workspaces(0)
+
+    ' Tabelle leeren
+    db.Execute "DELETE FROM tblPerfTest_Emails", dbFailOnError
+
+    Set rs = db.OpenRecordset("tblPerfTest_Emails", dbOpenDynaset)
+
+    t1 = GetTickCount()
+
+    If blnTransaction Then
+        ws.BeginTrans
+        blnTransOpen = True
+    End If
+
+    For n = 1 To lngAnzahl
+        rs.AddNew
+        rs!Hash = GeneriereTestHash(n)
+        rs!Betreff = "Testmail Nr. " & n
+        rs!Absender = "Testuser " & (n Mod 50)
+        rs!AbsenderEmail = "test" & (n Mod 50) & "@example.com"
+        rs!DatumGesendet = DateAdd("h", -n, Now)
+        rs!DatumEmpfangen = DateAdd("h", -n + 0.1, Now)
+        rs!Groesse = CLng(10000) + CLng(n) * 137&
+        rs!AnhangAnzahl = CInt(n Mod 5)
+        rs!OrdnerID = 1
+        rs!SyncLaufID = 1
+        rs!ErstelltAm = Now
+        rs.Update
+    Next n
+
+    If blnTransOpen Then
+        ws.CommitTrans
+        blnTransOpen = False
+    End If
+
+    t2 = GetTickCount()
+    rs.Close: Set rs = Nothing
+    Set db = Nothing: Set ws = Nothing
+
+    ' Ergebnis ausgeben
+    Dim lngZeit As Long: lngZeit = t2 - t1
+    Dim strLabel As String
+    If blnTransaction Then
+        strLabel = "1 Trans (" & lngAnzahl & ")"
+    Else
+        strLabel = "Kein Trans"
+    End If
+
+    ' Faktor: Vergleich pro-Record-Zeit vs Baseline
+    Dim strFaktor As String
+    If Not blnTransaction Then
+        strFaktor = "Baseline"
+    ElseIf lngZeit = 0 Then
+        strFaktor = "(< 16ms)"
+    ElseIf m_lngBaselineLinked > 0 And lngAnzahl > 0 Then
+        Dim dblBaselineProRec As Double
+        dblBaselineProRec = CDbl(m_lngBaselineLinked) / CDbl(m_lngAnzahlRecords)
+        Dim dblTestProRec As Double
+        dblTestProRec = CDbl(lngZeit) / CDbl(lngAnzahl)
+        strFaktor = Format(dblBaselineProRec / dblTestProRec, "0.0") & "x"
+    Else
+        strFaktor = "n/a"
+    End If
+
+    Debug.Print PadR(strLabel, 16) & _
+                PadR(CStr(lngAnzahl), 10) & _
+                PadR(FormatMS(lngZeit), 12) & _
+                PadR(FormatProRec(lngZeit, lngAnzahl), 12) & _
+                strFaktor
+
+    ' Baseline merken
+    If Not blnTransaction Then m_lngBaselineLinked = lngZeit
+
+    RunBatchWriteTest_Linked = lngZeit
+    Exit Function
+
+ErrHandler:
+    Dim strErr As String: strErr = Err.Description
+    Dim lngErr As Long: lngErr = Err.Number
+    On Error Resume Next
+    If blnTransOpen Then ws.Rollback
+    If Not rs Is Nothing Then rs.Close
+    On Error GoTo 0
+    If lngErr = 3246 Then
+        Debug.Print "  " & IIf(blnTransaction, "Trans(" & lngAnzahl & ")", "Baseline") & _
+                    ": Transaktionen NICHT UNTERSTUETZT auf Linked Tables (Error 3246)"
+    Else
+        Debug.Print "  FEHLER bei " & IIf(blnTransaction, "Trans(" & lngAnzahl & ")", "Baseline") & _
+                    ": [" & lngErr & "] " & strErr
+    End If
+    RunBatchWriteTest_Linked = -1
+End Function
+
+
+' ---------------------------------------------------------------------------
+' TEST: Schreibmethoden ueber LINKED TABLE (Recordset vs Execute vs QueryDef)
+' ---------------------------------------------------------------------------
+Private Sub TestSchreibMethoden_Linked()
+    On Error GoTo ErrHandler
+
+    Debug.Print "--- LINKED TABLE: SCHREIBMETHODEN-VERGLEICH (1 Trans, alle Records) ---"
+    Debug.Print ""
+    Debug.Print PadR("Methode", 24) & PadR("Records", 10) & _
+                PadR("Zeit", 12) & PadR("Pro Record", 12) & "Info"
+    Debug.Print String(70, "-")
+
+    Dim db As DAO.Database
+    Dim ws As DAO.Workspace
+    Set db = CurrentDb
+    Set ws = DBEngine.Workspaces(0)
+
+    Dim t1 As Long, t2 As Long
+    Dim n As Long
+
+    ' --- Methode A: Recordset.AddNew ---
+    db.Execute "DELETE FROM tblPerfTest_Emails", dbFailOnError
+    Dim rs As DAO.Recordset
+    Set rs = db.OpenRecordset("tblPerfTest_Emails", dbOpenDynaset)
+    Dim blnTO As Boolean: blnTO = False
+
+    t1 = GetTickCount()
+    ws.BeginTrans: blnTO = True
+    For n = 1 To m_lngAnzahlRecords
+        rs.AddNew
+        rs!Hash = GeneriereTestHash(n)
+        rs!Betreff = "Recordset Test " & n
+        rs!Absender = "User " & n
+        rs!AbsenderEmail = "user" & n & "@test.de"
+        rs!DatumGesendet = Now
+        rs!Groesse = 50000
+        rs!ErstelltAm = Now
+        rs.Update
+    Next n
+    ws.CommitTrans: blnTO = False
+    t2 = GetTickCount()
+    rs.Close: Set rs = Nothing
+
+    Debug.Print PadR("Recordset.AddNew", 24) & _
+                PadR(CStr(m_lngAnzahlRecords), 10) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, m_lngAnzahlRecords), 12) & _
+                "Aktueller Ansatz in modDAO"
+
+    ' --- Methode B: db.Execute INSERT ---
+    db.Execute "DELETE FROM tblPerfTest_Emails", dbFailOnError
+
+    t1 = GetTickCount()
+    ws.BeginTrans: blnTO = True
+    For n = 1 To m_lngAnzahlRecords
+        db.Execute "INSERT INTO tblPerfTest_Emails " & _
+            "(Hash, Betreff, Absender, AbsenderEmail, DatumGesendet, Groesse, ErstelltAm) " & _
+            "VALUES ('" & GeneriereTestHash(n) & "', " & _
+            "'Execute Test " & n & "', " & _
+            "'User " & n & "', " & _
+            "'user" & n & "@test.de', " & _
+            SQLJetzt() & ", " & _
+            "50000, " & _
+            SQLJetzt() & ")", dbFailOnError
+    Next n
+    ws.CommitTrans: blnTO = False
+    t2 = GetTickCount()
+
+    Debug.Print PadR("Execute INSERT SQL", 24) & _
+                PadR(CStr(m_lngAnzahlRecords), 10) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, m_lngAnzahlRecords), 12) & _
+                "SQL-String pro Record"
+
+    ' --- Methode C: QueryDef mit Parametern ---
+    db.Execute "DELETE FROM tblPerfTest_Emails", dbFailOnError
+
+    Dim qd As DAO.QueryDef
+    Set qd = db.CreateQueryDef("", _
+        "PARAMETERS [pHash] Text(64), [pBetreff] Text(255), " & _
+        "[pAbsender] Text(255), [pEmail] Text(255), " & _
+        "[pDatum] DateTime, [pGroesse] Long, [pErstellt] DateTime; " & _
+        "INSERT INTO tblPerfTest_Emails " & _
+        "(Hash, Betreff, Absender, AbsenderEmail, DatumGesendet, Groesse, ErstelltAm) " & _
+        "VALUES ([pHash], [pBetreff], [pAbsender], [pEmail], [pDatum], [pGroesse], [pErstellt])")
+
+    t1 = GetTickCount()
+    ws.BeginTrans: blnTO = True
+    For n = 1 To m_lngAnzahlRecords
+        qd.Parameters("pHash") = GeneriereTestHash(n)
+        qd.Parameters("pBetreff") = "QueryDef Test " & n
+        qd.Parameters("pAbsender") = "User " & n
+        qd.Parameters("pEmail") = "user" & n & "@test.de"
+        qd.Parameters("pDatum") = Now
+        qd.Parameters("pGroesse") = 50000
+        qd.Parameters("pErstellt") = Now
+        qd.Execute dbFailOnError
+    Next n
+    ws.CommitTrans: blnTO = False
+    t2 = GetTickCount()
+    qd.Close: Set qd = Nothing
+
+    Debug.Print PadR("QueryDef Parameter", 24) & _
+                PadR(CStr(m_lngAnzahlRecords), 10) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, m_lngAnzahlRecords), 12) & _
+                "Parametrisiert, SQL-Injection-sicher"
+
+    Debug.Print String(70, "-")
+    Debug.Print ""
+
+    Set db = Nothing: Set ws = Nothing
+    Exit Sub
+
+ErrHandler:
+    Dim strErrSM As String: strErrSM = Err.Description
+    Dim lngErrSM As Long: lngErrSM = Err.Number
+    SichereRollback
+    If lngErrSM = 3246 Then
+        Debug.Print "  Transaktionen NICHT UNTERSTUETZT auf Linked Tables (Error 3246)"
+        Debug.Print "  -> Linked Tables nur OHNE Transaktion verwenden."
+    Else
+        Debug.Print "  FEHLER: [" & lngErrSM & "] " & strErrSM
+    End If
+End Sub
+
+
+' ---------------------------------------------------------------------------
+' TEST: Batch-Schreiben ueber DIRECT DAO (verschiedene Batch-Groessen)
+' ---------------------------------------------------------------------------
+Private Sub TestBatchSchreiben_Direct()
+    On Error GoTo ErrHandler
+
+    Debug.Print "--- DIRECT DAO WRITES (je EINE Transaktion pro Test) ---"
+    Debug.Print "    (DAO.OpenDatabase direkt auf Netzwerk-DB, kein Linked Table)"
+    Debug.Print ""
+    Debug.Print PadR("Methode", 16) & PadR("Records", 10) & _
+                PadR("Zeit", 12) & PadR("Pro Record", 12) & "vs Baseline"
+    Debug.Print String(62, "-")
+
+    m_lngBaselineDirect = 0
+
+    ' Baseline: Ohne Transaktion (schreibt m_lngAnzahlRecords)
+    RunBatchWriteTest_Direct m_lngAnzahlRecords, False
+
+    ' Einzelne Transaktionen verschiedener Groesse
+    RunBatchWriteTest_Direct 10, True
+    RunBatchWriteTest_Direct 25, True
+    RunBatchWriteTest_Direct 50, True
+    RunBatchWriteTest_Direct 100, True
+
+    Debug.Print String(62, "-")
+    Debug.Print ""
+
+    ' Vergleich Linked vs Direct
+    If m_lngBaselineLinked > 0 And m_lngBaselineDirect > 0 Then
+        Debug.Print "VERGLEICH (ohne Transaction, Baseline):"
+        Debug.Print "  Linked : " & FormatMS(m_lngBaselineLinked) & " (" & _
+                    FormatProRec(m_lngBaselineLinked, m_lngAnzahlRecords) & " pro Record)"
+        Debug.Print "  Direct : " & FormatMS(m_lngBaselineDirect) & " (" & _
+                    FormatProRec(m_lngBaselineDirect, m_lngAnzahlRecords) & " pro Record)"
+        If m_lngBaselineDirect > 0 Then
+            Debug.Print "  -> Direct ist " & _
+                Format(CDbl(m_lngBaselineLinked) / CDbl(m_lngBaselineDirect), "0.0") & _
+                "x " & IIf(m_lngBaselineDirect < m_lngBaselineLinked, "schneller", "langsamer")
+        End If
+        Debug.Print ""
+    End If
+
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "  FEHLER: " & Err.Description
+End Sub
+
+
+' Einzelner Write-Test ueber Direct DAO (EINE Transaktion, kein Cycling)
+' lngAnzahl: Anzahl Records die geschrieben werden
+' blnTransaction: True = in BeginTrans/CommitTrans wrappen
+Private Function RunBatchWriteTest_Direct(ByVal lngAnzahl As Long, _
+                                           ByVal blnTransaction As Boolean) As Long
+    On Error GoTo ErrHandler
+
+    Dim dbDirect As DAO.Database
+    Dim ws As DAO.Workspace
+    Dim rs As DAO.Recordset
+    Dim t1 As Long, t2 As Long
+    Dim n As Long
+    Dim blnTransOpen As Boolean: blnTransOpen = False
+
+    Set ws = DBEngine.Workspaces(0)
+    Set dbDirect = ws.OpenDatabase(m_strTestDBPfad)
+
+    ' Tabelle leeren
+    dbDirect.Execute "DELETE FROM tblTestEmails", dbFailOnError
+
+    Set rs = dbDirect.OpenRecordset("tblTestEmails", dbOpenDynaset)
+
+    t1 = GetTickCount()
+
+    If blnTransaction Then
+        ws.BeginTrans
+        blnTransOpen = True
+    End If
+
+    For n = 1 To lngAnzahl
+        rs.AddNew
+        rs!Hash = GeneriereTestHash(n)
+        rs!Betreff = "Direct Test " & n
+        rs!Absender = "Testuser " & (n Mod 50)
+        rs!AbsenderEmail = "test" & (n Mod 50) & "@example.com"
+        rs!DatumGesendet = DateAdd("h", -n, Now)
+        rs!DatumEmpfangen = DateAdd("h", -n + 0.1, Now)
+        rs!Groesse = CLng(10000) + CLng(n) * 137&
+        rs!AnhangAnzahl = CInt(n Mod 5)
+        rs!OrdnerID = 1
+        rs!SyncLaufID = 1
+        rs!ErstelltAm = Now
+        rs.Update
+    Next n
+
+    If blnTransOpen Then
+        ws.CommitTrans
+        blnTransOpen = False
+    End If
+
+    t2 = GetTickCount()
+    rs.Close: Set rs = Nothing
+    dbDirect.Close: Set dbDirect = Nothing: Set ws = Nothing
+
+    ' Ergebnis
+    Dim lngZeit As Long: lngZeit = t2 - t1
+    Dim strLabel As String
+    If blnTransaction Then
+        strLabel = "1 Trans (" & lngAnzahl & ")"
+    Else
+        strLabel = "Kein Trans"
+    End If
+
+    ' Faktor: pro-Record-Zeit vs Baseline
+    Dim strFaktor As String
+    If Not blnTransaction Then
+        strFaktor = "Baseline"
+    ElseIf lngZeit = 0 Then
+        strFaktor = "(< 16ms)"
+    ElseIf m_lngBaselineDirect > 0 And lngAnzahl > 0 Then
+        Dim dblBPR As Double
+        dblBPR = CDbl(m_lngBaselineDirect) / CDbl(m_lngAnzahlRecords)
+        Dim dblTPR As Double
+        dblTPR = CDbl(lngZeit) / CDbl(lngAnzahl)
+        strFaktor = Format(dblBPR / dblTPR, "0.0") & "x"
+    Else
+        strFaktor = "n/a"
+    End If
+
+    Debug.Print PadR(strLabel, 16) & _
+                PadR(CStr(lngAnzahl), 10) & _
+                PadR(FormatMS(lngZeit), 12) & _
+                PadR(FormatProRec(lngZeit, lngAnzahl), 12) & _
+                strFaktor
+
+    If Not blnTransaction Then m_lngBaselineDirect = lngZeit
+
+    RunBatchWriteTest_Direct = lngZeit
+    Exit Function
+
+ErrHandler:
+    Dim strErrD As String: strErrD = Err.Description
+    Dim lngErrD As Long: lngErrD = Err.Number
+    On Error Resume Next
+    If blnTransOpen Then ws.Rollback
+    If Not rs Is Nothing Then rs.Close
+    If Not dbDirect Is Nothing Then dbDirect.Close
+    On Error GoTo 0
+    If lngErrD = 3246 Then
+        Debug.Print "  " & IIf(blnTransaction, "Trans(" & lngAnzahl & ")", "Baseline") & _
+                    ": Transaktionen NICHT UNTERSTUETZT auf Netzwerk-DB (Error 3246)"
+    Else
+        Debug.Print "  FEHLER bei " & IIf(blnTransaction, "Trans(" & lngAnzahl & ")", "Baseline") & _
+                    ": [" & lngErrD & "] " & strErrD
+    End If
+    RunBatchWriteTest_Direct = -1
+End Function
+
+
+' ---------------------------------------------------------------------------
+' TEST: Memo-Feld Performance (HTML Body verschiedene Groessen)
+' ---------------------------------------------------------------------------
+Private Sub TestMemoSchreiben()
+    On Error GoTo ErrHandler
+
+    Debug.Print "--- MEMO-FELD PERFORMANCE (tblTestContent, Direct DAO, 1 Trans) ---"
+    Debug.Print ""
+    Debug.Print PadR("HTML-Groesse", 16) & PadR("Records", 10) & _
+                PadR("Zeit", 12) & PadR("Pro Record", 12) & "Daten-Vol."
+    Debug.Print String(62, "-")
+
+    ' 3 Groessen testen: 1KB, 50KB, 500KB
+    RunMemoWriteTest 1
+    RunMemoWriteTest 50
+    RunMemoWriteTest 500
+
+    Debug.Print String(62, "-")
+    Debug.Print ""
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "  FEHLER: " & Err.Description
+End Sub
+
+
+Private Sub RunMemoWriteTest(ByVal lngKB As Long)
+    On Error GoTo ErrHandler
+
+    Dim dbDirect As DAO.Database
+    Dim ws As DAO.Workspace
+    Dim rs As DAO.Recordset
+    Dim t1 As Long, t2 As Long
+    Dim n As Long
+    Dim strHTML As String
+
+    Set ws = DBEngine.Workspaces(0)
+    Set dbDirect = ws.OpenDatabase(m_strTestDBPfad)
+
+    ' Tabelle leeren
+    dbDirect.Execute "DELETE FROM tblTestContent", dbFailOnError
+
+    ' HTML-Testinhalt generieren
+    strHTML = GeneriereTestHTML(lngKB)
+
+    ' Anzahl Records (weniger bei grossen Memos)
+    Dim lngCount As Long
+    If lngKB >= 500 Then
+        lngCount = 10
+    ElseIf lngKB >= 50 Then
+        lngCount = 25
+    Else
+        lngCount = m_lngAnzahlRecords
+    End If
+
+    Set rs = dbDirect.OpenRecordset("tblTestContent", dbOpenDynaset)
+    Dim blnMemoTO As Boolean: blnMemoTO = False
+
+    t1 = GetTickCount()
+    ws.BeginTrans: blnMemoTO = True
+
+    For n = 1 To lngCount
+        rs.AddNew
+        rs!EmailID = n
+        rs!BodyHTML = strHTML
+        rs!BodyPlain = Left(strHTML, CLng(lngKB) * 100&)
+        rs!ErstelltAm = Now
+        rs.Update
+    Next n
+
+    ws.CommitTrans: blnMemoTO = False
+    t2 = GetTickCount()
+
+    rs.Close: Set rs = Nothing
+    dbDirect.Close: Set dbDirect = Nothing: Set ws = Nothing
+
+    Dim lngZeit As Long: lngZeit = t2 - t1
+    Dim dblVolMB As Double
+    dblVolMB = (CDbl(lngKB) * CDbl(lngCount)) / 1024
+
+    Debug.Print PadR(lngKB & " KB", 16) & _
+                PadR(CStr(lngCount), 10) & _
+                PadR(FormatMS(lngZeit), 12) & _
+                PadR(FormatProRec(lngZeit, lngCount), 12) & _
+                Format(dblVolMB, "0.0") & " MB total"
+    Exit Sub
+
+ErrHandler:
+    Dim strErrM As String: strErrM = Err.Description
+    Dim lngErrM As Long: lngErrM = Err.Number
+    On Error Resume Next
+    If blnMemoTO Then ws.Rollback
+    If Not rs Is Nothing Then rs.Close
+    If Not dbDirect Is Nothing Then dbDirect.Close
+    On Error GoTo 0
+    Debug.Print "  FEHLER bei " & lngKB & "KB: [" & lngErrM & "] " & strErrM
+End Sub
+
+
+' ---------------------------------------------------------------------------
+' TEST: Hash-Lookup Performance (Duplikatpruefung)
+' ---------------------------------------------------------------------------
+Private Sub TestHashLookup()
+    On Error GoTo ErrHandler
+
+    Debug.Print "--- HASH-LOOKUP PERFORMANCE (Duplikatpruefung) ---"
+    Debug.Print ""
+
+    Dim dbDirect As DAO.Database
+    Dim ws As DAO.Workspace
+    Dim rs As DAO.Recordset
+    Dim t1 As Long, t2 As Long
+    Dim n As Long
+
+    Set ws = DBEngine.Workspaces(0)
+    Set dbDirect = ws.OpenDatabase(m_strTestDBPfad)
+
+    ' --- Vorbereitung: 1000 Records einfuegen ---
+    Debug.Print "Fuege 1000 Test-Records fuer Lookup ein..."
+    dbDirect.Execute "DELETE FROM tblTestEmails", dbFailOnError
+
+    Set rs = dbDirect.OpenRecordset("tblTestEmails", dbOpenDynaset)
+    Dim blnLookupTO As Boolean: blnLookupTO = False
+    ws.BeginTrans: blnLookupTO = True
+    For n = 1 To 1000
+        rs.AddNew
+        rs!Hash = GeneriereTestHash(n)
+        rs!Betreff = "Lookup Test " & n
+        rs!Absender = "user"
+        rs!AbsenderEmail = "user@test.de"
+        rs!DatumGesendet = Now
+        rs!Groesse = 10000&
+        rs!ErstelltAm = Now
+        rs.Update
+    Next n
+    ws.CommitTrans: blnLookupTO = False
+    rs.Close: Set rs = Nothing
+    Debug.Print "  -> 1000 Records eingefuegt."
+    Debug.Print ""
+
+    Debug.Print PadR("Methode", 30) & PadR("Batch", 8) & _
+                PadR("Zeit", 12) & PadR("Pro Lookup", 12) & "Treffer"
+    Debug.Print String(74, "-")
+
+    ' --- Test A: DCount einzeln (25 Lookups, via Direct DAO) ---
+    Dim lngFound As Long
+    t1 = GetTickCount()
+    lngFound = 0
+    For n = 1 To 25
+        ' 13 existierende + 12 nicht-existierende Hashes
+        Dim strH As String
+        If n Mod 2 = 0 Then
+            strH = GeneriereTestHash(n * 3)        ' existiert (n*3 <= 1000)
+        Else
+            strH = GeneriereTestHash(n + 5000)     ' existiert NICHT
+        End If
+        Set rs = dbDirect.OpenRecordset( _
+            "SELECT Count(*) FROM tblTestEmails WHERE Hash='" & strH & "'", dbOpenSnapshot)
+        If Not rs.EOF Then
+            If Nz(rs(0), 0) > 0 Then lngFound = lngFound + 1
+        End If
+        rs.Close: Set rs = Nothing
+    Next n
+    t2 = GetTickCount()
+
+    Debug.Print PadR("Count(*) einzeln (Direct)", 30) & PadR("1", 8) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, 25), 12) & _
+                lngFound & "/25"
+
+    ' --- Test B: SELECT WHERE Hash = '...' einzeln (Direct DAO) ---
+    t1 = GetTickCount()
+    lngFound = 0
+    For n = 1 To 25
+        If n Mod 2 = 0 Then
+            strH = GeneriereTestHash(n * 3)
+        Else
+            strH = GeneriereTestHash(n + 5000)
+        End If
+        Set rs = dbDirect.OpenRecordset( _
+            "SELECT Hash FROM tblTestEmails WHERE Hash='" & strH & "'", dbOpenSnapshot)
+        If Not rs.EOF Then lngFound = lngFound + 1
+        rs.Close: Set rs = Nothing
+    Next n
+    t2 = GetTickCount()
+
+    Debug.Print PadR("SELECT einzeln (Direct)", 30) & PadR("1", 8) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, 25), 12) & _
+                lngFound & "/25"
+
+    ' --- Test C: SELECT WHERE Hash IN (...) Batch=25 (Direct DAO) ---
+    ' Genau wie modAsyncBuffer.PruefeHashes() es macht
+    Dim strIN As String
+    strIN = ""
+    For n = 1 To 25
+        If n Mod 2 = 0 Then
+            strH = GeneriereTestHash(n * 3)
+        Else
+            strH = GeneriereTestHash(n + 5000)
+        End If
+        If strIN <> "" Then strIN = strIN & ","
+        strIN = strIN & "'" & strH & "'"
+    Next n
+
+    t1 = GetTickCount()
+    lngFound = 0
+    Set rs = dbDirect.OpenRecordset( _
+        "SELECT Hash FROM tblTestEmails WHERE Hash IN (" & strIN & ")", dbOpenSnapshot)
+    Do While Not rs.EOF
+        lngFound = lngFound + 1
+        rs.MoveNext
+    Loop
+    rs.Close: Set rs = Nothing
+    t2 = GetTickCount()
+
+    Debug.Print PadR("SELECT IN() Batch (Direct)", 30) & PadR("25", 8) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, 25), 12) & _
+                lngFound & "/25"
+
+    ' --- Test D: SELECT IN() Batch=50 ---
+    strIN = ""
+    For n = 1 To 50
+        If n Mod 2 = 0 Then
+            strH = GeneriereTestHash(n * 3)
+        Else
+            strH = GeneriereTestHash(n + 5000)
+        End If
+        If strIN <> "" Then strIN = strIN & ","
+        strIN = strIN & "'" & strH & "'"
+    Next n
+
+    t1 = GetTickCount()
+    lngFound = 0
+    Set rs = dbDirect.OpenRecordset( _
+        "SELECT Hash FROM tblTestEmails WHERE Hash IN (" & strIN & ")", dbOpenSnapshot)
+    Do While Not rs.EOF
+        lngFound = lngFound + 1
+        rs.MoveNext
+    Loop
+    rs.Close: Set rs = Nothing
+    t2 = GetTickCount()
+
+    Debug.Print PadR("SELECT IN() Batch (Direct)", 30) & PadR("50", 8) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, 50), 12) & _
+                lngFound & "/50"
+
+    ' --- Test E: SELECT IN() Batch=100 ---
+    strIN = ""
+    For n = 1 To 100
+        If n Mod 2 = 0 Then
+            strH = GeneriereTestHash(n * 3)
+        Else
+            strH = GeneriereTestHash(n + 5000)
+        End If
+        If strIN <> "" Then strIN = strIN & ","
+        strIN = strIN & "'" & strH & "'"
+    Next n
+
+    t1 = GetTickCount()
+    lngFound = 0
+    Set rs = dbDirect.OpenRecordset( _
+        "SELECT Hash FROM tblTestEmails WHERE Hash IN (" & strIN & ")", dbOpenSnapshot)
+    Do While Not rs.EOF
+        lngFound = lngFound + 1
+        rs.MoveNext
+    Loop
+    rs.Close: Set rs = Nothing
+    t2 = GetTickCount()
+
+    Debug.Print PadR("SELECT IN() Batch (Direct)", 30) & PadR("100", 8) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, 100), 12) & _
+                lngFound & "/100"
+
+    Debug.Print String(74, "-")
+    Debug.Print ""
+    Debug.Print "HINWEIS: DCount geht ueber Linked Table (ACE-Overhead)."
+    Debug.Print "         SELECT-Tests gehen ueber Direct DAO (kein Linked-Table-Overhead)."
+    Debug.Print "         IN()-Batch reduziert Netzwerk-Roundtrips drastisch."
+    Debug.Print ""
+
+    dbDirect.Close: Set dbDirect = Nothing: Set ws = Nothing
+    Exit Sub
+
+ErrHandler:
+    Dim strErrHL As String: strErrHL = Err.Description
+    Dim lngErrHL As Long: lngErrHL = Err.Number
+    On Error Resume Next
+    SichereRollback
+    If Not rs Is Nothing Then rs.Close
+    If Not dbDirect Is Nothing Then dbDirect.Close
+    On Error GoTo 0
+    Debug.Print "  FEHLER: [" & lngErrHL & "] " & strErrHL
+End Sub
+
+
+' ===========================================================================
+' BEREICH 3: OUTLOOK-EXTRAKTION
+' ===========================================================================
+
+' Testet verschiedene Methoden zur Mail-Daten-Extraktion.
+' Vergleicht: OOM Basic, OOM + Body, Redemption SafeMailItem, Redemption RDO,
+'             und das vollstaendige Extract-Release-Pattern.
+Public Sub TestOutlookExtraktion(Optional ByVal lngAnzahl As Long = 50)
+    On Error GoTo ErrHandler
+
+    ' QPC Frequenz (falls Einzelaufruf)
+    QueryPerformanceFrequency m_curFrequency
+
+    Debug.Print String(80, "=")
+    Debug.Print "  OUTLOOK-EXTRAKTION PERFORMANCE"
+    Debug.Print String(80, "=")
+    Debug.Print ""
+
+    ' --- Outlook verbinden ---
+    Dim objApp As Object
+    On Error Resume Next
+    Set objApp = GetObject(, "Outlook.Application")
+    If objApp Is Nothing Then Set objApp = CreateObject("Outlook.Application")
+    On Error GoTo ErrHandler
+
+    If objApp Is Nothing Then
+        Debug.Print "*** FEHLER: Outlook ist nicht verfuegbar!"
+        Debug.Print "    Outlook muss laufen fuer diesen Test."
+        Exit Sub
+    End If
+
+    Dim objNS As Object
+    Set objNS = objApp.GetNamespace("MAPI")
+
+    ' Inbox holen
+    Dim objFolder As Object
+    Set objFolder = objNS.GetDefaultFolder(6) ' olFolderInbox = 6
+
+    Debug.Print "  Outlook     : " & objApp.Version
+    Debug.Print "  Ordner      : " & objFolder.FolderPath
+    Debug.Print "  Elemente    : " & objFolder.Items.Count
+    Debug.Print "  Test-Anzahl : " & lngAnzahl & " Mails"
+    Debug.Print ""
+
+    If objFolder.Items.Count = 0 Then
+        Debug.Print "*** Ordner ist leer! Bitte Ordner mit Mails waehlen."
+        Exit Sub
+    End If
+
+    If lngAnzahl > objFolder.Items.Count Then lngAnzahl = objFolder.Items.Count
+
+    ' --- Nur MailItems zaehlen ---
+    Debug.Print "Suche MailItems..."
+    Dim colItems As Object
+    Set colItems = objFolder.Items
+
+    ' Sammle Indizes von MailItems
+    Dim aMailIdx() As Long
+    ReDim aMailIdx(0 To lngAnzahl - 1)
+    Dim lngGefunden As Long: lngGefunden = 0
+    Dim i As Long
+
+    For i = 1 To colItems.Count
+        If lngGefunden >= lngAnzahl Then Exit For
+        On Error Resume Next
+        Dim strTypName As String
+        strTypName = TypeName(colItems(i))
+        On Error GoTo ErrHandler
+        If strTypName = "MailItem" Then
+            aMailIdx(lngGefunden) = i
+            lngGefunden = lngGefunden + 1
+        End If
+    Next i
+
+    If lngGefunden = 0 Then
+        Debug.Print "*** Keine MailItems im Ordner gefunden!"
+        Exit Sub
+    End If
+    If lngGefunden < lngAnzahl Then
+        lngAnzahl = lngGefunden
+        ReDim Preserve aMailIdx(0 To lngAnzahl - 1)
+    End If
+    Debug.Print "  -> " & lngAnzahl & " MailItems gefunden."
+    Debug.Print ""
+
+    Debug.Print PadR("Methode", 32) & PadR("Mails", 8) & _
+                PadR("Gesamt", 12) & PadR("Pro Mail", 12) & "Details"
+    Debug.Print String(76, "-")
+
+    ' =====================================================================
+    ' TEST 1: OOM Basic (Subject, Date, Size - KEIN Security Issue)
+    ' =====================================================================
+    Dim t1 As Long, t2 As Long
+    Dim objItem As Object
+    Dim strDummy As String
+    Dim dtDummy As Date
+    Dim lngDummy As Long
+    Dim intDummy As Integer
+    Dim blnDummy As Boolean
+
+    t1 = GetTickCount()
+    For i = 0 To lngAnzahl - 1
+        Set objItem = colItems(aMailIdx(i))
+        On Error Resume Next
+        strDummy = objItem.Subject
+        strDummy = objItem.SenderName
+        dtDummy = objItem.SentOn
+        dtDummy = objItem.ReceivedTime
+        lngDummy = objItem.Size
+        intDummy = objItem.Importance
+        blnDummy = objItem.UnRead
+        strDummy = objItem.MessageClass
+        strDummy = objItem.ConversationTopic
+        strDummy = objItem.EntryID
+        intDummy = objItem.Attachments.Count
+        On Error GoTo ErrHandler
+        Set objItem = Nothing
+    Next i
+    t2 = GetTickCount()
+
+    Debug.Print PadR("OOM Basic (kein Security)", 32) & _
+                PadR(CStr(lngAnzahl), 8) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, lngAnzahl), 12) & _
+                "Subject,Date,Size,EntryID..."
+
+    ' =====================================================================
+    ' TEST 2: OOM + Body/HTMLBody (grosse Properties)
+    ' =====================================================================
+    t1 = GetTickCount()
+    For i = 0 To lngAnzahl - 1
+        Set objItem = colItems(aMailIdx(i))
+        On Error Resume Next
+        strDummy = objItem.Subject
+        strDummy = objItem.SenderName
+        dtDummy = objItem.SentOn
+        dtDummy = objItem.ReceivedTime
+        lngDummy = objItem.Size
+        strDummy = objItem.Body
+        strDummy = objItem.HTMLBody
+        strDummy = objItem.ConversationTopic
+        On Error GoTo ErrHandler
+        Set objItem = Nothing
+    Next i
+    t2 = GetTickCount()
+
+    Debug.Print PadR("OOM + Body/HTMLBody", 32) & _
+                PadR(CStr(lngAnzahl), 8) & _
+                PadR(FormatMS(t2 - t1), 12) & _
+                PadR(FormatProRec(t2 - t1, lngAnzahl), 12) & _
+                "Inkl. HTML+PlainText Laden"
+
+    ' =====================================================================
+    ' TEST 3: OOM + SenderEmailAddress (ACHTUNG: Security Guard!)
+    ' =====================================================================
+    Debug.Print PadR("OOM + Email (SECURITY!)", 32) & _
+                PadR("-", 8) & PadR("-", 12) & PadR("-", 12) & _
+                "UEBERSPRUNGEN (OOM Security Guard)"
+
+    ' =====================================================================
+    ' TEST 4: Redemption SafeMailItem (alle Felder)
+    ' =====================================================================
+    Dim blnRedemptionOK As Boolean: blnRedemptionOK = False
+    Dim objSafe As Object
+
+    On Error Resume Next
+    Set objSafe = CreateObject("Redemption.SafeMailItem")
+    blnRedemptionOK = (Err.Number = 0 And Not objSafe Is Nothing)
+    Err.Clear
+    On Error GoTo ErrHandler
+
+    If blnRedemptionOK Then
+        t1 = GetTickCount()
+        For i = 0 To lngAnzahl - 1
+            Set objItem = colItems(aMailIdx(i))
+            objSafe.Item = objItem
+
+            On Error Resume Next
+            strDummy = objSafe.Subject
+            strDummy = objSafe.SenderName
+            strDummy = objSafe.SenderEmailAddress  ' KEIN Security Prompt!
+            dtDummy = objSafe.SentOn
+            dtDummy = objSafe.ReceivedTime
+            lngDummy = objSafe.Size
+            intDummy = objSafe.Importance
+            blnDummy = objSafe.UnRead
+            strDummy = objSafe.Body
+            strDummy = objSafe.HTMLBody
+            strDummy = objSafe.ConversationTopic
+            strDummy = objSafe.EntryID
+            intDummy = objSafe.Attachments.Count
+            On Error GoTo ErrHandler
+            Set objItem = Nothing
+        Next i
+        t2 = GetTickCount()
+
+        Debug.Print PadR("Redemption SafeMailItem", 32) & _
+                    PadR(CStr(lngAnzahl), 8) & _
+                    PadR(FormatMS(t2 - t1), 12) & _
+                    PadR(FormatProRec(t2 - t1, lngAnzahl), 12) & _
+                    "Alle Felder, KEIN Security Prompt"
+    Else
+        Debug.Print PadR("Redemption SafeMailItem", 32) & _
+                    PadR("-", 8) & PadR("-", 12) & PadR("-", 12) & _
+                    "NICHT VERFUEGBAR (Redemption nicht installiert)"
+    End If
+
+    ' =====================================================================
+    ' TEST 5: Redemption RDO (direkter MAPI-Zugriff)
+    ' =====================================================================
+    Dim blnRDOOK As Boolean: blnRDOOK = False
+    Dim objRDOSession As Object
+    Dim objRDOFolder As Object
+
+    On Error Resume Next
+    Set objRDOSession = CreateObject("Redemption.RDOSession")
+    If Err.Number = 0 And Not objRDOSession Is Nothing Then
+        ' MAPI-Session von Outlook uebernehmen
+        objRDOSession.MAPIOBJECT = objNS.MAPIOBJECT
+        If Err.Number = 0 Then
+            ' Ordner per EntryID/StoreID holen
+            Set objRDOFolder = objRDOSession.GetFolderFromID( _
+                objFolder.EntryID, objFolder.StoreID)
+            blnRDOOK = (Err.Number = 0 And Not objRDOFolder Is Nothing)
+        End If
+    End If
+    Err.Clear
+    On Error GoTo ErrHandler
+
+    If blnRDOOK Then
+        Dim objRDOMail As Object
+
+        t1 = GetTickCount()
+        For i = 0 To lngAnzahl - 1
+            ' Hole RDO-Mail ueber OOM-EntryID
+            Set objItem = colItems(aMailIdx(i))
+            On Error Resume Next
+            Set objRDOMail = objRDOSession.GetMessageFromID( _
+                objItem.EntryID, objFolder.StoreID)
+            On Error GoTo ErrHandler
+
+            If Not objRDOMail Is Nothing Then
+                On Error Resume Next
+                strDummy = objRDOMail.Subject
+                strDummy = objRDOMail.SenderName
+                strDummy = objRDOMail.SenderEmailAddress
+                dtDummy = objRDOMail.SentOn
+                dtDummy = objRDOMail.ReceivedTime
+                lngDummy = objRDOMail.Size
+                intDummy = objRDOMail.Importance
+                blnDummy = objRDOMail.UnRead
+                strDummy = objRDOMail.Body
+                strDummy = objRDOMail.HTMLBody
+                strDummy = objRDOMail.EntryID
+                intDummy = objRDOMail.Attachments.Count
+                ' MAPI Properties (wie im echten ExtrahiereMailDaten)
+                strDummy = objRDOMail.Fields(&H1035001E)  ' PR_INTERNET_MESSAGE_ID
+                strDummy = objRDOMail.Fields(&HE04001E)   ' PR_DISPLAY_TO
+                strDummy = objRDOMail.Fields(&H7D001E)    ' PR_TRANSPORT_MESSAGE_HEADERS
+                On Error GoTo ErrHandler
+                Set objRDOMail = Nothing
+            End If
+            Set objItem = Nothing
+        Next i
+        t2 = GetTickCount()
+
+        Debug.Print PadR("Redemption RDO (MAPI)", 32) & _
+                    PadR(CStr(lngAnzahl), 8) & _
+                    PadR(FormatMS(t2 - t1), 12) & _
+                    PadR(FormatProRec(t2 - t1, lngAnzahl), 12) & _
+                    "Alle Felder + MAPI Properties"
+    Else
+        Debug.Print PadR("Redemption RDO (MAPI)", 32) & _
+                    PadR("-", 8) & PadR("-", 12) & PadR("-", 12) & _
+                    "NICHT VERFUEGBAR"
+    End If
+
+    ' =====================================================================
+    ' TEST 6: Recipients (Empfaenger-Auflistung) via Redemption
+    ' =====================================================================
+    If blnRedemptionOK Then
+        t1 = GetTickCount()
+        Dim lngTotalRecp As Long: lngTotalRecp = 0
+        For i = 0 To lngAnzahl - 1
+            Set objItem = colItems(aMailIdx(i))
+            objSafe.Item = objItem
+            On Error Resume Next
+            Dim objRecipients As Object
+            Set objRecipients = objSafe.Recipients
+            If Not objRecipients Is Nothing Then
+                Dim r As Long
+                For r = 1 To objRecipients.Count
+                    strDummy = objRecipients(r).Name
+                    strDummy = objRecipients(r).Address
+                    intDummy = objRecipients(r).Type
+                    lngTotalRecp = lngTotalRecp + 1
+                Next r
+            End If
+            On Error GoTo ErrHandler
+            Set objItem = Nothing
+        Next i
+        t2 = GetTickCount()
+
+        Debug.Print PadR("Redemption Recipients", 32) & _
+                    PadR(CStr(lngAnzahl), 8) & _
+                    PadR(FormatMS(t2 - t1), 12) & _
+                    PadR(FormatProRec(t2 - t1, lngAnzahl), 12) & _
+                    lngTotalRecp & " Empfaenger total"
+    End If
+
+    ' =====================================================================
+    ' TEST 7: Extract-Release Pattern (COM-Haltezeit messen)
+    ' =====================================================================
+    If blnRDOOK Then
+        Dim lngCOMZeitTotal As Long: lngCOMZeitTotal = 0
+        Dim lngHashZeitTotal As Long: lngHashZeitTotal = 0
+        Dim lngReleaseCount As Long: lngReleaseCount = 0
+
+        t1 = GetTickCount()
+        For i = 0 To lngAnzahl - 1
+            Set objItem = colItems(aMailIdx(i))
+            On Error Resume Next
+            Set objRDOMail = objRDOSession.GetMessageFromID( _
+                objItem.EntryID, objFolder.StoreID)
+            On Error GoTo ErrHandler
+
+            If Not objRDOMail Is Nothing Then
+                ' --- PHASE A: COM aktiv - Daten extrahieren ---
+                Dim tA1 As Long: tA1 = GetTickCount()
+
+                Dim strBetreff As String, strAbsender As String
+                Dim strAbsEmail As String, strBody As String
+                Dim strHTML As String, strMsgID As String
+                Dim dtEmpfangen As Date, dtGesendet As Date
+                Dim lngGroesse As Long, intAnz As Integer
+
+                On Error Resume Next
+                strBetreff = objRDOMail.Subject
+                strAbsender = objRDOMail.SenderName
+                strAbsEmail = objRDOMail.SenderEmailAddress
+                dtGesendet = objRDOMail.SentOn
+                dtEmpfangen = objRDOMail.ReceivedTime
+                lngGroesse = objRDOMail.Size
+                strBody = objRDOMail.Body
+                strHTML = objRDOMail.HTMLBody
+                strMsgID = objRDOMail.Fields(&H1035001E)
+                intAnz = objRDOMail.Attachments.Count
+                On Error GoTo ErrHandler
+
+                ' --- COM freigeben ---
+                Set objRDOMail = Nothing
+                Set objItem = Nothing
+
+                Dim tA2 As Long: tA2 = GetTickCount()
+                lngCOMZeitTotal = lngCOMZeitTotal + (tA2 - tA1)
+
+                ' --- PHASE B: Ohne COM - Hash berechnen ---
+                Dim tB1 As Long: tB1 = GetTickCount()
+                Dim strHash As String
+                strHash = TestSHA256(strBetreff & "|" & strAbsEmail & "|" & _
+                                     Format(dtEmpfangen, "yyyymmddhhnnss"))
+                Dim tB2 As Long: tB2 = GetTickCount()
+                lngHashZeitTotal = lngHashZeitTotal + (tB2 - tB1)
+
+                lngReleaseCount = lngReleaseCount + 1
+            Else
+                Set objItem = Nothing
+            End If
+        Next i
+        t2 = GetTickCount()
+
+        Debug.Print String(76, "-")
+        Debug.Print ""
+        Debug.Print "EXTRACT-RELEASE PATTERN (COM-Haltezeit):"
+        Debug.Print "  Getestete Mails    : " & lngReleaseCount
+        Debug.Print "  Gesamt-Zeit        : " & FormatMS(t2 - t1)
+        Debug.Print "  COM-Haltezeit ges. : " & FormatMS(lngCOMZeitTotal) & _
+                    " (" & FormatProRec(lngCOMZeitTotal, lngReleaseCount) & " pro Mail)"
+        Debug.Print "  Hash-Zeit ges.     : " & FormatMS(lngHashZeitTotal) & _
+                    " (" & FormatProRec(lngHashZeitTotal, lngReleaseCount) & " pro Mail)"
+        If (t2 - t1) > 0 Then
+            Debug.Print "  COM-Anteil         : " & _
+                Format(CDbl(lngCOMZeitTotal) / CDbl(t2 - t1) * 100, "0.0") & "%"
+        End If
+        Debug.Print ""
+        Debug.Print "  BEWERTUNG:"
+        If lngReleaseCount > 0 Then
+            Dim dblProMail As Double
+            dblProMail = CDbl(lngCOMZeitTotal) / CDbl(lngReleaseCount)
+            If dblProMail < 10 Then
+                Debug.Print "  -> HERVORRAGEND: COM unter 10ms pro Mail."
+                Debug.Print "     Extract-Release entlastet Outlook effektiv."
+            ElseIf dblProMail < 50 Then
+                Debug.Print "  -> GUT: COM unter 50ms pro Mail."
+                Debug.Print "     Extract-Release sinnvoll."
+            ElseIf dblProMail < 200 Then
+                Debug.Print "  -> MAESSIG: COM 50-200ms pro Mail."
+                Debug.Print "     Body/HTML Laden dominiert. Evtl. lazy loading erwaegen."
+            Else
+                Debug.Print "  -> LANGSAM: COM ueber 200ms pro Mail."
+                Debug.Print "     Exchange-Latenz? Netzwerk-Probleme?"
+            End If
+        End If
+        Debug.Print "  HINWEIS: Ohne Anhang-/MSG-Speicherung gemessen!"
+        Debug.Print "           Anhang-SaveAsFile wuerde COM-Zeit erhoehen."
+    End If
+
+    Debug.Print ""
+    Debug.Print String(76, "-")
+    Debug.Print ""
+
+    ' --- Aufraeumen ---
+    On Error Resume Next
+    Set objSafe = Nothing
+    Set objRDOFolder = Nothing
+    If Not objRDOSession Is Nothing Then
+        objRDOSession.Logoff
+        Set objRDOSession = Nothing
+    End If
+    Set objFolder = Nothing
+    Set objNS = Nothing
+    ' objApp NICHT schliessen (Outlook laeuft weiter)
+    Set objApp = Nothing
+    On Error GoTo 0
+
+    Debug.Print "Outlook-Tests abgeschlossen."
+    Debug.Print String(80, "=")
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "*** FEHLER in TestOutlookExtraktion: " & Err.Description
+    On Error Resume Next
+    Set objSafe = Nothing
+    Set objRDOFolder = Nothing
+    If Not objRDOSession Is Nothing Then objRDOSession.Logoff
+    Set objRDOSession = Nothing
+    Set objRDOMail = Nothing
+    Set objItem = Nothing
+    Set objFolder = Nothing
+    Set objNS = Nothing
+    Set objApp = Nothing
+    On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
+' BEREICH 3b: ECHTER SYNC-LASTTEST (End-to-End)
+' ===========================================================================
+
+' Fuehrt einen Lasttest gegen den echten Sync-Pfad durch (modSync.SyncFolder).
+' Fokus: Outlook-Stabilitaet, COM-Retries/Reconnects, Laufzeit unter Last.
+'
+' Parameter:
+'   strOrdnerPfad  - Voller Outlook-Pfad (z.B. "Postfach\Posteingang\FLIWAS")
+'   lngLaeufe      - Anzahl Durchlaeufe (Standard: 3)
+'   lngMaxMails    - Max Mails pro Lauf (Standard: 250)
+'   lngPauseSek    - Pause zwischen Laeufen in Sekunden (Standard: 5)
+'   blnSubfolder   - Unterordner mit synchronisieren?
+'
+' Hinweis:
+'   - Nutzt die produktive Sync-Routine inkl. DB/Datei-I/O.
+'   - Vorab in Testumgebung oder mit begrenztem Mail-Limit starten.
+Public Sub TestSyncLasttest(ByVal strOrdnerPfad As String, _
+                             Optional ByVal lngLaeufe As Long = 3, _
+                             Optional ByVal lngMaxMails As Long = 250, _
+                             Optional ByVal lngPauseSek As Long = 5, _
+                             Optional ByVal blnSubfolder As Boolean = False)
+    On Error GoTo ErrHandler
+
+    Dim i As Long
+    Dim t1 As Long, t2 As Long
+    Dim lngErr As Long
+    Dim strErr As String
+    Dim lngRunMS As Long
+    Dim lngMin As Long, lngMax As Long, lngSum As Long
+    Dim lngFail As Long, lngOK As Long
+    Dim lngRetriesDelta As Long, lngReconnectsDelta As Long
+    Dim lngRetriesSum As Long, lngReconnectsSum As Long
+    Dim lngRetriesBefore As Long, lngReconnectsBefore As Long
+    Dim lngRetriesAfter As Long, lngReconnectsAfter As Long
+    Dim strFolderEntryID As String
+    Dim strFolderStoreID As String
+    Dim objRunFolder As Object
+
+    If Trim$(strOrdnerPfad) = "" Then
+        Debug.Print "*** FEHLER: Ordnerpfad erforderlich."
+        Debug.Print "    Beispiel: TestSyncLasttest ""Postfach\Posteingang\FLIWAS"""
+        Exit Sub
+    End If
+
+    If lngLaeufe < 1 Then lngLaeufe = 1
+    If lngLaeufe > 50 Then lngLaeufe = 50
+    If lngMaxMails < 1 Then lngMaxMails = 1
+    If lngPauseSek < 0 Then lngPauseSek = 0
+
+    If Not ConnectRDO() Then
+        Debug.Print "*** FEHLER: Keine RDO-Verbindung (Outlook/Redemption nicht bereit)."
+        Exit Sub
+    End If
+
+    ' Vorab pruefen, ob Ordner erreichbar ist (robuste Aufloesung).
+    Dim objProbe As Object
+    Debug.Print "[LASTTEST] Resolving Ordnerpfad..."
+    DoEvents
+    Set objProbe = ResolveSyncLasttestOrdner(strOrdnerPfad)
+    If objProbe Is Nothing Then
+        Debug.Print "*** FEHLER: Ordner nicht gefunden: " & strOrdnerPfad
+        Debug.Print "    Verfuegbare Stores:"
+        PrintVerfuegbareStores
+        Debug.Print "    Tipp: Nutze exakten Store-Namen + Ordnerpfad,"
+        Debug.Print "          z.B. ""<StoreName>\Posteingang\Unterordner""."
+        Exit Sub
+    End If
+
+    On Error Resume Next
+    strFolderEntryID = Nz(objProbe.EntryID, "")
+    strFolderStoreID = Nz(objProbe.StoreID, "")
+    On Error GoTo ErrHandler
+    If strFolderEntryID = "" Then
+        Debug.Print "*** FEHLER: Ordner-EntryID nicht lesbar."
+        Set objProbe = Nothing
+        Exit Sub
+    End If
+
+    Debug.Print "[LASTTEST] Ordner aufgeloest: " & Nz(objProbe.FolderPath, strOrdnerPfad)
+    DoEvents
+    Set objProbe = Nothing
+
+    Debug.Print ""
+    Debug.Print String(80, "=")
+    Debug.Print "  SYNC-LASTTEST (ECHTER END-TO-END PFAD)"
+    Debug.Print String(80, "=")
+    Debug.Print "  Start       : " & Now()
+    Debug.Print "  Ordner      : " & strOrdnerPfad
+    Debug.Print "  Laeufe      : " & lngLaeufe
+    Debug.Print "  Max/Lauf    : " & lngMaxMails
+    Debug.Print "  Subfolder   : " & IIf(blnSubfolder, "Ja", "Nein")
+    Debug.Print "  Pause       : " & lngPauseSek & " s"
+    Debug.Print String(80, "-")
+    Debug.Print PadR("Lauf", 8) & PadR("Status", 12) & PadR("Dauer", 12) & _
+                PadR("COM-Retry", 12) & PadR("Reconnect", 12) & "Fehler"
+    Debug.Print String(80, "-")
+
+    lngMin = 0
+    lngMax = 0
+
+    For i = 1 To lngLaeufe
+        DoEvents
+
+        lngRetriesBefore = COMRetryZaehler()
+        lngReconnectsBefore = COMReconnectZaehler()
+
+        lngErr = 0
+        strErr = ""
+
+        Debug.Print "[LASTTEST] Lauf " & i & "/" & lngLaeufe & ": hole Ordner per EntryID..."
+        DoEvents
+
+        Set objRunFolder = Nothing
+        On Error Resume Next
+        If strFolderStoreID <> "" Then
+            Set objRunFolder = g_objRDO.GetFolderFromID(strFolderEntryID, strFolderStoreID)
+        Else
+            Set objRunFolder = g_objRDO.GetFolderFromID(strFolderEntryID)
+        End If
+        On Error GoTo ErrHandler
+
+        If objRunFolder Is Nothing Then
+            ' Fallback nur wenn noetig (kann teuer sein)
+            Debug.Print "[LASTTEST] Fallback: erneute Pfadauflosung..."
+            DoEvents
+            Set objRunFolder = ResolveSyncLasttestOrdner(strOrdnerPfad)
+        End If
+
+        If objRunFolder Is Nothing Then
+            lngFail = lngFail + 1
+            Debug.Print PadR("#" & i, 8) & PadR("FAIL", 12) & _
+                        PadR("-", 12) & PadR("0", 12) & PadR("0", 12) & _
+                        "Ordner konnte vor Lauf nicht aufgeloest werden"
+            GoTo NextRun
+        End If
+
+        t1 = GetTickCount()
+        On Error Resume Next
+        SyncFolder objRunFolder, "Lasttest", "Run" & Format$(i, "00"), lngMaxMails, blnSubfolder
+        lngErr = Err.Number
+        strErr = Err.Description
+        Err.Clear
+        On Error GoTo ErrHandler
+        t2 = GetTickCount()
+        Set objRunFolder = Nothing
+
+        lngRunMS = t2 - t1
+        lngRetriesAfter = COMRetryZaehler()
+        lngReconnectsAfter = COMReconnectZaehler()
+        lngRetriesDelta = lngRetriesAfter - lngRetriesBefore
+        lngReconnectsDelta = lngReconnectsAfter - lngReconnectsBefore
+
+        lngRetriesSum = lngRetriesSum + lngRetriesDelta
+        lngReconnectsSum = lngReconnectsSum + lngReconnectsDelta
+
+        If lngErr = 0 Then
+            lngOK = lngOK + 1
+            lngSum = lngSum + lngRunMS
+            If lngMin = 0 Or lngRunMS < lngMin Then lngMin = lngRunMS
+            If lngRunMS > lngMax Then lngMax = lngRunMS
+
+            Debug.Print PadR("#" & i, 8) & PadR("OK", 12) & _
+                        PadR(FormatMS(lngRunMS), 12) & _
+                        PadR(CStr(lngRetriesDelta), 12) & _
+                        PadR(CStr(lngReconnectsDelta), 12) & "-"
+        Else
+            lngFail = lngFail + 1
+            Debug.Print PadR("#" & i, 8) & PadR("FAIL", 12) & _
+                        PadR(FormatMS(lngRunMS), 12) & _
+                        PadR(CStr(lngRetriesDelta), 12) & _
+                        PadR(CStr(lngReconnectsDelta), 12) & _
+                        Left$("[" & lngErr & "] " & Nz(strErr, ""), 120)
+        End If
+
+        If i < lngLaeufe And lngPauseSek > 0 Then
+            Sleep CLng(lngPauseSek) * 1000&
+        End If
+
+NextRun:
+        Set objRunFolder = Nothing
+    Next i
+
+    Debug.Print String(80, "-")
+    Debug.Print "  ZUSAMMENFASSUNG"
+    Debug.Print "  Erfolgreich  : " & lngOK & "/" & lngLaeufe
+    Debug.Print "  Fehlgeschlag.: " & lngFail
+    If lngOK > 0 Then
+        Debug.Print "  Durchschnitt : " & FormatMS(CLng(lngSum / lngOK))
+        Debug.Print "  Min/Max      : " & FormatMS(lngMin) & " / " & FormatMS(lngMax)
+    End If
+    Debug.Print "  COM-Retries  : " & lngRetriesSum
+    Debug.Print "  Reconnects   : " & lngReconnectsSum
+    Debug.Print "  Ende         : " & Now()
+    Debug.Print String(80, "=")
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "*** FEHLER in TestSyncLasttest: [" & Err.Number & "] " & Err.Description
+End Sub
+
+
+' Robuste Ordner-Aufloesung fuer Lasttest:
+'   1) Exakter Pfad ueber OeffneOrdner
+'   2) Fallback: Suffix-Match gegen FolderPath in allen Stores
+Private Function ResolveSyncLasttestOrdner(ByVal strOrdnerPfad As String) As Object
+    On Error GoTo ErrHandler
+
+    Dim strNorm As String
+    strNorm = NormalizeSyncPfad(strOrdnerPfad)
+    If strNorm = "" Then
+        Set ResolveSyncLasttestOrdner = Nothing
+        Exit Function
+    End If
+
+    ' 1) Exakter Match
+    Set ResolveSyncLasttestOrdner = OeffneOrdner(strNorm)
+    If Not ResolveSyncLasttestOrdner Is Nothing Then Exit Function
+
+    ' 2) Fallback: in allen Stores nach passendem Suffix suchen
+    Dim objStore As Object
+    Dim objFound As Object
+    For Each objStore In g_objRDO.Stores
+        Set objFound = FindFolderByPathSuffix(objStore.RootFolder, strNorm, 0, 12)
+        If Not objFound Is Nothing Then
+            Set ResolveSyncLasttestOrdner = objFound
+            Set objFound = Nothing
+            Set objStore = Nothing
+            Exit Function
+        End If
+        Set objFound = Nothing
+        Set objStore = Nothing
+    Next objStore
+
+    Set ResolveSyncLasttestOrdner = Nothing
+    Exit Function
+
+ErrHandler:
+    Set ResolveSyncLasttestOrdner = Nothing
+End Function
+
+
+' Rekursive Suche nach FolderPath-EndsWith(target)
+Private Function FindFolderByPathSuffix(objFolder As Object, _
+                                        ByVal strTargetNorm As String, _
+                                        ByVal lngDepth As Long, _
+                                        ByVal lngMaxDepth As Long) As Object
+    On Error GoTo ErrHandler
+
+    If objFolder Is Nothing Then Exit Function
+    If lngDepth > lngMaxDepth Then Exit Function
+
+    Dim strPath As String
+    strPath = NormalizeSyncPfad(Nz(objFolder.FolderPath, ""))
+
+    If strPath <> "" Then
+        If StrComp(strPath, strTargetNorm, vbTextCompare) = 0 Then
+            Set FindFolderByPathSuffix = objFolder
+            Exit Function
+        End If
+
+        ' Erlaubt Aufruf ohne exakten Store-Namen.
+        If Right$("\\" & strPath, Len("\\" & strTargetNorm) + 1) = "\\" & strTargetNorm Then
+            Set FindFolderByPathSuffix = objFolder
+            Exit Function
+        End If
+    End If
+
+    Dim objSub As Object
+    Dim objFound As Object
+    For Each objSub In objFolder.Folders
+        Set objFound = FindFolderByPathSuffix(objSub, strTargetNorm, lngDepth + 1, lngMaxDepth)
+        If Not objFound Is Nothing Then
+            Set FindFolderByPathSuffix = objFound
+            Set objFound = Nothing
+            Set objSub = Nothing
+            Exit Function
+        End If
+        Set objFound = Nothing
+        Set objSub = Nothing
+    Next objSub
+
+    Set objSub = Nothing
+    Exit Function
+
+ErrHandler:
+    Set FindFolderByPathSuffix = Nothing
+End Function
+
+
+' Vereinheitlicht Outlook-Pfade fuer robuste Vergleiche.
+Private Function NormalizeSyncPfad(ByVal strPfad As String) As String
+    strPfad = Trim$(Nz(strPfad, ""))
+    If strPfad = "" Then
+        NormalizeSyncPfad = ""
+        Exit Function
+    End If
+
+    Do While Right$(strPfad, 1) = "\\"
+        strPfad = Left$(strPfad, Len(strPfad) - 1)
+        If strPfad = "" Then Exit Do
+    Loop
+
+    NormalizeSyncPfad = strPfad
+End Function
+
+
+' Gibt die aktuellen Store-Namen als Diagnose aus.
+Private Sub PrintVerfuegbareStores()
+    On Error Resume Next
+    Dim objStore As Object
+    For Each objStore In g_objRDO.Stores
+        Debug.Print "      - " & Nz(objStore.DisplayName, "(ohne Namen)")
+    Next objStore
+    Set objStore = Nothing
+    On Error GoTo 0
+End Sub
+
+
+' ===========================================================================
+' BEREICH 4: SHA256-HASHING PERFORMANCE
+' ===========================================================================
+
+' Testet SHA256-Durchsatz mit verschiedenen Eingabegroessen
+Public Sub TestHashingSpeed(Optional ByVal lngIterationen As Long = 1000)
+    On Error GoTo ErrHandler
+
+    ' QPC Frequenz (falls Einzelaufruf)
+    QueryPerformanceFrequency m_curFrequency
+
+    Debug.Print String(80, "=")
+    Debug.Print "  SHA256-HASHING PERFORMANCE (CryptoAPI)"
+    Debug.Print String(80, "=")
+    Debug.Print ""
+    Debug.Print PadR("Eingabe", 14) & PadR("Anzahl", 10) & _
+                PadR("Gesamt", 12) & PadR("Pro Hash", 12) & "Durchsatz"
+    Debug.Print String(60, "-")
+
+    ' Test A: 100 Bytes (typischer Mail-Hash-Input: Betreff|Email|Datum)
+    RunHashTest 100, lngIterationen
+
+    ' Test B: 1 KB (laengerer Input)
+    RunHashTest 1024, lngIterationen
+
+    ' Test C: 50 KB (Body-Hash Szenario)
+    RunHashTest 50& * 1024&, CLng(lngIterationen / 10)
+
+    ' Test D: 500 KB (grosser HTML-Body)
+    RunHashTest 500& * 1024&, CLng(lngIterationen / 100)
+
+    Debug.Print String(60, "-")
+    Debug.Print ""
+
+    ' Praxisbewertung
+    Debug.Print "PRAXIS-BEWERTUNG:"
+    Debug.Print "  Mail-Hash (100 Bytes): Der typische UseCase fuer Duplikatpruefung."
+    Debug.Print "  Bei 10.000 Mails mit 100-Byte-Hash circa " & _
+                Format(CDbl(lngIterationen) / CDbl(IIf(m_lngLetzteHashZeit > 0, _
+                m_lngLetzteHashZeit, 1)) * 10, "#,##0") & " Hashes pro Sekunde."
+    Debug.Print "  -> SHA256 ist kein Flaschenhals fuer die Sync-Performance."
+    Debug.Print ""
+    Debug.Print String(80, "=")
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "*** FEHLER: " & Err.Description
+End Sub
+
+Private Sub RunHashTest(ByVal lngBytes As Long, ByVal lngAnzahl As Long)
+    On Error GoTo ErrHandler
+
+    If lngAnzahl < 1 Then lngAnzahl = 1
+
+    ' Teststring generieren
+    Dim strInput As String
+    strInput = String(lngBytes, "A")
+    ' Etwas Variation einbauen
+    If lngBytes > 10 Then Mid(strInput, 5, 5) = "12345"
+
+    Dim t1 As Long, t2 As Long
+    Dim n As Long
+    Dim strResult As String
+
+    t1 = GetTickCount()
+    For n = 1 To lngAnzahl
+        strResult = TestSHA256(strInput)
+        If n Mod 100 = 0 Then DoEvents
+    Next n
+    t2 = GetTickCount()
+
+    Dim lngZeit As Long: lngZeit = t2 - t1
+    If lngBytes <= 100 Then m_lngLetzteHashZeit = lngZeit
+
+    ' Durchsatz berechnen
+    Dim strDurchsatz As String
+    If lngZeit > 0 Then
+        Dim dblPS As Double
+        dblPS = CDbl(lngAnzahl) / (CDbl(lngZeit) / 1000)
+        strDurchsatz = Format(dblPS, "#,##0") & " /Sek"
+    Else
+        strDurchsatz = ">>1000 /Sek"
+    End If
+
+    ' Eingabegroesse formatieren
+    Dim strGroesse As String
+    If lngBytes >= 1024 Then
+        strGroesse = Format(lngBytes / 1024, "0") & " KB"
+    Else
+        strGroesse = lngBytes & " Bytes"
+    End If
+
+    Debug.Print PadR(strGroesse, 14) & _
+                PadR(CStr(lngAnzahl), 10) & _
+                PadR(FormatMS(lngZeit), 12) & _
+                PadR(FormatProRec(lngZeit, lngAnzahl), 12) & _
+                strDurchsatz
+    Exit Sub
+
+ErrHandler:
+    Debug.Print "  FEHLER bei " & lngBytes & " Bytes: " & Err.Description
+End Sub
+
+
+' ===========================================================================
+' SHA256 - Eigenstaendige Implementierung (fuer Benchmark)
+' ===========================================================================
+
+' SHA256-Hash aus String (ANSI) berechnen.
+' Gibt 64 Zeichen Hex-String zurueck, oder "" bei Fehler.
+Private Function TestSHA256(ByVal strInput As String) As String
+    On Error GoTo ErrHandler
+
+    #If VBA7 Then
+        Dim hProv As LongPtr, hHash As LongPtr
+    #Else
+        Dim hProv As Long, hHash As Long
+    #End If
+
+    Dim abData()    As Byte
+    Dim abHash(0 To 31) As Byte
+    Dim lngHashLen  As Long
+    Dim j           As Long
+    Dim strResult   As String
+
+    If Len(strInput) = 0 Then TestSHA256 = "": Exit Function
+
+    ' String -> Byte-Array (ANSI)
+    abData = StrConv(strInput, vbFromUnicode)
+
+    ' Provider oeffnen
+    If CryptAcquireContext(hProv, vbNullString, vbNullString, _
+                           PROV_RSA_AES, CRYPT_VERIFYCONTEXT) = 0 Then
+        TestSHA256 = "": Exit Function
+    End If
+
+    ' Hash-Objekt erstellen
+    If CryptCreateHash(hProv, CALG_SHA_256, 0, 0, hHash) = 0 Then
+        CryptReleaseContext hProv, 0
+        TestSHA256 = "": Exit Function
+    End If
+
+    ' Daten hashen
+    If CryptHashData(hHash, abData(0), UBound(abData) + 1, 0) = 0 Then
+        CryptDestroyHash hHash
+        CryptReleaseContext hProv, 0
+        TestSHA256 = "": Exit Function
+    End If
+
+    ' Hash-Wert lesen
+    lngHashLen = 32
+    CryptGetHashParam hHash, HP_HASHVAL, abHash(0), lngHashLen, 0
+
+    ' In Hex-String
+    strResult = ""
+    For j = 0 To 31
+        strResult = strResult & Right("0" & Hex(abHash(j)), 2)
+    Next j
+
+    ' Aufraeumen
+    CryptDestroyHash hHash
+    CryptReleaseContext hProv, 0
+
+    TestSHA256 = LCase(strResult)
+    Exit Function
+
+ErrHandler:
+    On Error Resume Next
+    If hHash <> 0 Then CryptDestroyHash hHash
+    If hProv <> 0 Then CryptReleaseContext hProv, 0
+    TestSHA256 = ""
+End Function
+
+
+' ===========================================================================
+' TEST-BACKEND LOESCHEN
+' ===========================================================================
+Private Sub LoescheTestBackend()
+    On Error Resume Next
+
+    If m_strTestDBPfad <> "" Then
+        If Dir(m_strTestDBPfad) <> "" Then
+            Kill m_strTestDBPfad
+        End If
+        ' Auch .laccdb Lockfile loeschen
+        Dim strLock As String
+        strLock = Replace(m_strTestDBPfad, ".accdb", ".laccdb")
+        If Dir(strLock) <> "" Then
+            Sleep 500  ' Kurz warten bis Lock freigegeben
+            Kill strLock
+        End If
+    End If
+
+    On Error GoTo 0
+    Debug.Print "  -> Test-DB geloescht: " & m_strTestDBPfad
+End Sub
+
+
+' ===========================================================================
+' HILFSFUNKTIONEN
+' ===========================================================================
+
+' String rechts mit Leerzeichen auffuellen
+Private Function PadR(ByVal strText As String, ByVal lngLen As Long) As String
+    If Len(strText) >= lngLen Then
+        PadR = Left(strText, lngLen)
+    Else
+        PadR = strText & Space(lngLen - Len(strText))
+    End If
+End Function
+
+' Millisekunden formatieren (z.B. "3.5s" oder "78ms")
+Private Function FormatMS(ByVal lngMS As Long) As String
+    If lngMS < 0 Then
+        FormatMS = "FEHLER"
+    ElseIf lngMS >= 10000 Then
+        FormatMS = Format(CDbl(lngMS) / 1000, "0.0") & "s"
+    ElseIf lngMS >= 1000 Then
+        FormatMS = Format(CDbl(lngMS) / 1000, "0.00") & "s"
+    Else
+        FormatMS = lngMS & "ms"
+    End If
+End Function
+
+' Pro-Record-Zeit formatieren
+Private Function FormatProRec(ByVal lngTotalMS As Long, ByVal lngRecords As Long) As String
+    If lngRecords <= 0 Or lngTotalMS < 0 Then
+        FormatProRec = "-"
+        Exit Function
+    End If
+    Dim dblMS As Double
+    dblMS = CDbl(lngTotalMS) / CDbl(lngRecords)
+    If dblMS >= 100 Then
+        FormatProRec = Format(dblMS, "0") & " ms"
+    ElseIf dblMS >= 1 Then
+        FormatProRec = Format(dblMS, "0.0") & " ms"
+    ElseIf dblMS > 0 Then
+        FormatProRec = Format(dblMS, "0.00") & " ms"
+    Else
+        FormatProRec = "<0.01 ms"
+    End If
+End Function
+
+' Test-Hash generieren (deterministisch, 64 Zeichen Hex, Long-sicher)
+Private Function GeneriereTestHash(ByVal lngSeed As Long) As String
+    ' Bleibt im Long-Bereich: kein Hex()-Overflow bei grossen Seeds
+    ' (Hex() auf Double > 2^32 verursacht Error 6 in VBA)
+    Dim s1 As String, s2 As String
+    s1 = Right("00000000" & Hex(lngSeed), 8)
+    s2 = Right("00000000" & Hex(lngSeed Xor &H5A3C6B19), 8)
+    GeneriereTestHash = s1 & s2 & s1 & s2 & s1 & s2 & s1 & s2
+End Function
+
+' Test-HTML generieren (konfigurierbare Groesse in KB)
+Private Function GeneriereTestHTML(ByVal lngKB As Long) As String
+    Dim strHTML As String
+    Dim lngZielBytes As Long
+    lngZielBytes = lngKB * 1024
+
+    strHTML = "<html><head><title>Performance-Test</title></head><body>" & vbCrLf
+
+    ' Realistischen HTML-Content erzeugen
+    Dim strAbsatz As String
+    strAbsatz = "<p>Dies ist ein Testabsatz fuer die Performance-Messung. " & _
+                "Er simuliert typischen E-Mail-HTML-Content mit verschiedenen " & _
+                "Formatierungen. <b>Fettdruck</b>, <i>Kursiv</i>, " & _
+                "<a href=""https://example.com"">Links</a> und " & _
+                "<span style=""color: red;"">farbiger Text</span>. " & _
+                "Lorem ipsum dolor sit amet, " & _
+                "consectetur adipiscing elit, sed do eiusmod tempor incididunt " & _
+                "ut labore et dolore magna aliqua.</p>" & vbCrLf
+
+    ' Tabelle (realistisch fuer Business-Mails)
+    Dim strTabelle As String
+    strTabelle = "<table border=""1"" cellpadding=""5"">" & vbCrLf & _
+                 "<tr><th>Datum</th><th>Beschreibung</th><th>Betrag</th></tr>" & vbCrLf
+    Dim t As Long
+    For t = 1 To 10
+        strTabelle = strTabelle & "<tr><td>" & Format(DateAdd("d", -t, Now), "dd.mm.yyyy") & _
+                     "</td><td>Position " & t & " Leistungsbeschreibung</td>" & _
+                     "<td>" & Format(t * 1234.56, "#,##0.00") & " EUR</td></tr>" & vbCrLf
+    Next t
+    strTabelle = strTabelle & "</table>" & vbCrLf
+
+    strHTML = strHTML & strTabelle
+
+    ' Absaetze wiederholen bis Zielgroesse erreicht
+    Do While Len(strHTML) < lngZielBytes
+        strHTML = strHTML & strAbsatz
+        ' Alle 10 Absaetze eine Tabelle einfuegen
+        If Len(strHTML) Mod (Len(strAbsatz) * 10) < Len(strAbsatz) Then
+            strHTML = strHTML & strTabelle
+        End If
+    Loop
+
+    strHTML = Left(strHTML, lngZielBytes - 20) & vbCrLf & "</body></html>"
+    GeneriereTestHTML = strHTML
+End Function
+
+' DCount-Hilfsfunktion (Linked Table via CurrentDb, nicht Direct DAO)
+' Wird fuer den DCount-Hash-Lookup-Test verwendet
+Private Function DCountLinked(ByVal strExpr As String, _
+                               ByVal strDomain As String, _
+                               Optional ByVal strCriteria As String = "") As Long
+    On Error Resume Next
+    If strCriteria <> "" Then
+        DCountLinked = DCount(strExpr, strDomain, strCriteria)
+    Else
+        DCountLinked = DCount(strExpr, strDomain)
+    End If
+    If Err.Number <> 0 Then DCountLinked = 0
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+' Liest Config-Wert aus tblConfig (Standalone-Version)
+Private Function LeseConfigStandalone(ByVal strKey As String, _
+                                       ByVal strDefault As String) As String
+    On Error Resume Next
+    Dim rs As DAO.Recordset
+    Set rs = CurrentDb.OpenRecordset( _
+        "SELECT Wert FROM tblConfig WHERE Schluessel='" & strKey & "'", _
+        dbOpenSnapshot)
+    If Not rs.EOF Then
+        LeseConfigStandalone = Nz(rs!Wert, strDefault)
+    Else
+        LeseConfigStandalone = strDefault
+    End If
+    rs.Close: Set rs = Nothing
+
+    If Err.Number <> 0 Then LeseConfigStandalone = strDefault
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+

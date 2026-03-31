@@ -1,0 +1,450 @@
+Option Compare Database
+Option Explicit
+
+' ===========================================================================
+' modFileManager - Dateiablage + Netzwerk-Resilienz
+' ===========================================================================
+' v0.4: Verwaltet die Ablagestruktur fuer .msg-Dateien und Anhaenge
+' auf dem Netzlaufwerk. Inkl. Netzwerk-Pruefung, Retry-Logik und
+' Wiederaufnahme nach VPN-Verlust.
+'
+' ABLAGESTRUKTUR:
+'   <ExportBasis>\<Projekt>\<Phase>\
+'     YYYY\
+'       MM\
+'         YYYYMMDD_HHNN_Absender_Betreff\
+'           Mail.msg
+'           Anhaenge\
+'             Dateiname.ext
+'
+' Pfadlaenge: Max 260 Zeichen (Windows-Limit)
+'   ExportBasis ~80 + Projekt ~20 + Phase ~20 + YYYY\MM\ = 8
+'   + Ordnername max 80 + Dateiname max 50 = ~258
+'
+' Oeffentliche Routinen:
+'   BaueMailOrdnerPfad  - Erstellt Pfad fuer eine Mail
+'   BaueAnhangPfad      - Erstellt Pfad fuer einen Anhang
+'   IstNetzwerkOK       - Prueft Netzwerk-Erreichbarkeit
+'   WarteAufNetzwerk    - Wartet bis Netzwerk wieder da (mit Timeout)
+'   KopiereNachNetzwerk - Kopiert Datei mit Retry + Backoff
+'   ErstelleAblagePfad  - Baut den vollstaendigen Zielpfad
+'
+' Abhaengigkeiten: modStringUtils, modLogging
+' ===========================================================================
+
+
+' ---------------------------------------------------------------------------
+' KONSTANTEN
+' ---------------------------------------------------------------------------
+Private Const MAX_ORDNERNAME     As Long = 80    ' Max Laenge Mail-Ordnername
+Private Const MAX_DATEINAME      As Long = 50    ' Max Laenge Dateiname
+Private Const MAX_PFAD           As Long = 248   ' Windows MAX_PATH - 12 Reserve
+Private Const NETZWERK_TIMEOUT   As Long = 300   ' Sekunden Warten auf Netzwerk
+Private Const NETZWERK_POLL      As Long = 5000  ' ms zwischen Netzwerk-Pruefungen
+
+' Win32 API (GetTickCount; Sleep kommt aus modGlobals)
+#If VBA7 Then
+    Private Declare PtrSafe Function GetTickCount Lib "kernel32" () As Long
+    Private Declare PtrSafe Function GetDriveTypeA Lib "kernel32" (ByVal lpRootPathName As String) As Long
+#Else
+    Private Declare Function GetTickCount Lib "kernel32" () As Long
+    Private Declare Function GetDriveTypeA Lib "kernel32" (ByVal lpRootPathName As String) As Long
+#End If
+
+Private Const DRIVE_REMOTE As Long = 4
+
+
+' ===========================================================================
+' ABLAGESTRUKTUR: Mail-Ordner bauen
+' ===========================================================================
+
+' Gibt den vollstaendigen Ordnerpfad fuer eine Mail zurueck:
+'   <Basis>\<Projekt>\[<Phase>\]YYYY\MM\YYYYMMDD_HHNN_Absender_Betreff\
+'
+' v0.6: Phase-Ebene wird uebersprungen wenn strPhase leer ist.
+'        strProjekt kann Kuerzel, Name oder "_Eingang" sein.
+'
+' Parameter:
+'   strBasis     - Export-Basispfad (z.B. "\\Server\Share\Mails\")
+'   strProjekt   - Projektordner-Name (Kuerzel, Name oder "_Eingang")
+'   strPhase     - Phasenname (leer = Phase-Ebene entfaellt)
+'   dtEmpfangen  - Empfangsdatum der Mail
+'   strAbsender  - Absendername oder -email
+'   strBetreff   - Betreff der Mail
+'
+' Rueckgabe: Ordnerpfad MIT abschliessendem Backslash
+Public Function BaueMailOrdnerPfad(ByVal strBasis As String, _
+                                    ByVal strProjekt As String, _
+                                    ByVal strPhase As String, _
+                                    ByVal dtEmpfangen As Date, _
+                                    ByVal strAbsender As String, _
+                                    ByVal strBetreff As String) As String
+
+    ' Basis + Projekt
+    Dim strPfad As String
+    strPfad = NormalisierePfad(strBasis) & _
+              BereinigeDateiname(strProjekt, 30) & "\"
+
+    ' Phase (optional, v0.6: wird uebersprungen wenn leer)
+    If Trim(Nz(strPhase, "")) <> "" Then
+        strPfad = strPfad & BereinigeDateiname(strPhase, 30) & "\"
+    End If
+
+    ' Jahr + Monat
+    strPfad = strPfad & Format(dtEmpfangen, "yyyy") & "\" & _
+              Format(dtEmpfangen, "mm") & "\"
+
+    ' Mail-Ordnername: YYYYMMDD_HHNN_Absender_Betreff
+    Dim strOrdner As String
+    strOrdner = Format(dtEmpfangen, "yyyymmdd\_hhnn")
+
+    ' Absender kuerzen (nur Teil vor @, oder erstes Wort)
+    Dim strAbsKurz As String
+    strAbsKurz = KuerzeAbsender(strAbsender)
+    If strAbsKurz <> "" Then
+        strOrdner = strOrdner & "_" & BereinigeDateiname(strAbsKurz, 20)
+    End If
+
+    ' Betreff kuerzen
+    Dim strBetrKurz As String
+    strBetrKurz = BereinigeDateiname(BereinigeBetreff(strBetreff), 40)
+    If strBetrKurz <> "" And strBetrKurz <> "Unbenannt" Then
+        strOrdner = strOrdner & "_" & strBetrKurz
+    End If
+
+    ' Gesamtlaenge pruefen
+    If Len(strOrdner) > MAX_ORDNERNAME Then
+        strOrdner = Left(strOrdner, MAX_ORDNERNAME)
+    End If
+    ' Trailing Leerzeichen/Punkte entfernen (Windows verbietet das)
+    strOrdner = RTrimSpecial(strOrdner)
+
+    strPfad = strPfad & strOrdner & "\"
+
+    ' MAX_PATH pruefen
+    If Len(strPfad) > MAX_PFAD Then
+        ' Ordnername weiter kuerzen
+        Dim lngUeber As Long
+        lngUeber = Len(strPfad) - MAX_PFAD
+        strOrdner = Left(strOrdner, Len(strOrdner) - lngUeber - 5)
+        strOrdner = RTrimSpecial(strOrdner)
+        strPfad = NormalisierePfad(strBasis) & _
+                  BereinigeDateiname(strProjekt, 30) & "\" & _
+                  BereinigeDateiname(strPhase, 30) & "\" & _
+                  Format(dtEmpfangen, "yyyy") & "\" & _
+                  Format(dtEmpfangen, "mm") & "\" & _
+                  strOrdner & "\"
+    End If
+
+    BaueMailOrdnerPfad = strPfad
+End Function
+
+
+' ===========================================================================
+' ABLAGESTRUKTUR: Anhang-Pfad bauen
+' ===========================================================================
+
+' Gibt den Dateipfad fuer einen Anhang zurueck:
+'   <MailOrdner>\Anhaenge\Dateiname.ext
+'
+' Verwendet EindeutigerDateipfad um Ueberschreiben zu vermeiden.
+Public Function BaueAnhangPfad(ByVal strMailOrdner As String, _
+                                ByVal strDateiname As String) As String
+
+    Dim strAnhOrdner As String
+    strAnhOrdner = NormalisierePfad(strMailOrdner) & "Anhaenge\"
+
+    Dim strEndung As String
+    strEndung = HoleEndung(strDateiname)
+    If strEndung = "" Then strEndung = "bin"
+
+    Dim strName As String
+    strName = BereinigeDateiname(EntferneEndung(strDateiname), MAX_DATEINAME)
+
+    BaueAnhangPfad = EindeutigerDateipfad(strAnhOrdner, strName, strEndung)
+End Function
+
+
+' ===========================================================================
+' ABLAGESTRUKTUR: MSG-Pfad bauen
+' ===========================================================================
+
+' Gibt den Dateipfad fuer die .msg-Datei zurueck:
+'   <MailOrdner>\Mail.msg
+Public Function BaueMSGPfad(ByVal strMailOrdner As String) As String
+    BaueMSGPfad = EindeutigerDateipfad(NormalisierePfad(strMailOrdner), "Mail", "msg")
+End Function
+
+
+' ===========================================================================
+' NETZWERK-PRUEFUNG
+' ===========================================================================
+
+' Prueft ob ein Netzwerk-Pfad erreichbar ist (schneller Dir()-Test)
+Public Function IstNetzwerkOK(ByVal strNetzwerkPfad As String) As Boolean
+    On Error Resume Next
+
+    Dim strNormPfad As String
+    strNormPfad = NormalisierePfad(strNetzwerkPfad)
+
+    Dim strTest As String
+    strTest = Dir(strNormPfad, vbDirectory)
+
+    If Err.Number = 0 And strTest <> "" Then
+        IstNetzwerkOK = True
+        On Error GoTo 0
+        Exit Function
+    End If
+
+    Err.Clear
+    strTest = Dir(HoleNetzwerkPruefpfad(strNormPfad), vbDirectory)
+
+    IstNetzwerkOK = (Err.Number = 0 And strTest <> "")
+    Err.Clear
+    On Error GoTo 0
+End Function
+
+
+' Wartet bis Netzwerk wieder erreichbar ist (nach VPN-Verlust etc.)
+' Gibt True zurueck wenn Netzwerk innerhalb Timeout zurueckgekehrt.
+' Gibt False zurueck wenn Timeout ueberschritten oder Abbruch.
+'
+' Parameter:
+'   strNetzwerkPfad - UNC-Pfad zum Pruefen
+'   lngTimeoutSek   - Max. Wartezeit in Sekunden (0 = Default NETZWERK_TIMEOUT)
+Public Function WarteAufNetzwerk(ByVal strNetzwerkPfad As String, _
+                                  Optional ByVal lngTimeoutSek As Long = 0) As Boolean
+    ' Sicherheitsnetz: lokale Pfade duerfen nie in den Netzwerk-Wartepfad laufen.
+    If Not IstNetzwerkPfad(strNetzwerkPfad) Then
+        On Error Resume Next
+        ErstelleOrdner strNetzwerkPfad
+        On Error GoTo 0
+        WarteAufNetzwerk = True
+        Exit Function
+    End If
+
+    If lngTimeoutSek <= 0 Then lngTimeoutSek = NETZWERK_TIMEOUT
+
+    If IstNetzwerkOK(strNetzwerkPfad) Then
+        WarteAufNetzwerk = True
+        Exit Function
+    End If
+
+    LogWarn "Netzwerk nicht erreichbar: " & strNetzwerkPfad & _
+            " - Warte bis zu " & lngTimeoutSek & "s...", "FILEMANAGER"
+
+    Dim lngStart As Long
+    lngStart = GetTickCount()
+    Dim lngEnde As Long
+    lngEnde = lngStart + (lngTimeoutSek * 1000)
+    Dim lngLastLogS As Long
+    lngLastLogS = -1
+
+    Do
+        Sleep NETZWERK_POLL
+        DoEvents
+
+        ' Abbruch-Pruefung
+        If g_blnAbbrechen Then
+            LogWarn "Netzwerk-Warten abgebrochen durch Benutzer", "FILEMANAGER"
+            WarteAufNetzwerk = False
+            Exit Function
+        End If
+
+        If IstNetzwerkOK(strNetzwerkPfad) Then
+            Dim lngGewartet As Long
+            lngGewartet = (GetTickCount() - lngStart) \ 1000
+            LogInfo "Netzwerk wieder da nach " & lngGewartet & "s", "FILEMANAGER"
+            WarteAufNetzwerk = True
+            Exit Function
+        End If
+
+        ' Lebenszeichen fuer lange Wartephasen
+        Dim lngBisherS As Long
+        lngBisherS = (GetTickCount() - lngStart) \ 1000
+        If lngBisherS >= 10 Then
+            If (lngBisherS \ 10) <> lngLastLogS Then
+                lngLastLogS = (lngBisherS \ 10)
+                LogDebug "Warte auf Netzwerk... " & lngBisherS & "s/" & lngTimeoutSek & "s", "FILEMANAGER"
+            End If
+        End If
+    Loop While GetTickCount() < lngEnde
+
+    LogError "Netzwerk-Timeout nach " & lngTimeoutSek & "s: " & strNetzwerkPfad, "FILEMANAGER"
+    WarteAufNetzwerk = False
+End Function
+
+
+' ===========================================================================
+' DATEI-KOPIE MIT NETZWERK-RESILIENZ
+' ===========================================================================
+
+' Kopiert eine Datei von Quelle nach Ziel mit:
+'   - Zielverzeichnis automatisch erstellen
+'   - Retry bei Netzwerk-Fehler + exponentielles Backoff
+'   - Bei Netzwerk-Verlust: WarteAufNetzwerk() aufrufen
+'   - Abbruch-faehig (g_blnAbbrechen)
+'
+' Gibt True zurueck bei Erfolg.
+Public Function KopiereNachNetzwerk(ByVal strQuelle As String, _
+                                     ByVal strZiel As String, _
+                                     Optional ByVal intMaxVersuche As Integer = 3, _
+                                     Optional ByVal lngBasisPause As Long = 2000, _
+                                     Optional ByVal lngNetzwerkTimeoutSek As Long = 0) As Boolean
+    On Error GoTo ErrHandler
+
+    ' Quelldatei pruefen
+    If Dir(strQuelle) = "" Then
+        LogWarn "Quelldatei nicht gefunden: " & strQuelle, "FILEMANAGER"
+        KopiereNachNetzwerk = False
+        Exit Function
+    End If
+
+    ' Zielverzeichnis
+    Dim strZielDir As String
+    strZielDir = Left(strZiel, InStrRev(strZiel, "\"))
+    If strZielDir <> "" Then ErstelleOrdner strZielDir
+
+    ' Retry-Schleife
+    Dim intVersuch As Integer
+    Dim lngPause As Long
+    lngPause = lngBasisPause
+
+    For intVersuch = 1 To intMaxVersuche
+        If g_blnAbbrechen Then
+            KopiereNachNetzwerk = False
+            Exit Function
+        End If
+
+        On Error Resume Next
+        FileCopy strQuelle, strZiel
+
+        If Err.Number = 0 Then
+            On Error GoTo 0
+            LogTrace "Datei kopiert: " & strZiel, "FILEMANAGER"
+            KopiereNachNetzwerk = True
+            Exit Function
+        End If
+
+        ' Fehler auswerten
+        Dim lngErr As Long: lngErr = Err.Number
+        Dim strErr As String: strErr = Err.Description
+        Err.Clear
+        On Error GoTo ErrHandler
+
+        ' Netzwerk-Fehler? (typische Codes: 52, 53, 70, 75, 76)
+        If IstNetzwerkFehler(lngErr) Then
+            LogWarn "Netzwerk-Fehler bei Kopie (Versuch " & intVersuch & "): " & strErr, "FILEMANAGER"
+
+            ' Nur bei Netzwerkpfaden (UNC oder gemapptes Laufwerk) auf Wiederkehr warten.
+            ' Lokale Pfade koennen bei "Path not found" sonst faelschlich als Netzwerkfehler blockieren.
+            If IstNetzwerkPfad(strZielDir) Then
+                If Not WarteAufNetzwerk(strZielDir, lngNetzwerkTimeoutSek) Then
+                    LogError "Netzwerk nicht wiederhergestellt - Kopie abgebrochen: " & strQuelle, "FILEMANAGER"
+                    KopiereNachNetzwerk = False
+                    Exit Function
+                End If
+            End If
+
+            ' Zielverzeichnis ggf. nochmal erstellen
+            ErstelleOrdner strZielDir
+        Else
+            ' Sonstiger Fehler: Retry mit Backoff
+            If intVersuch < intMaxVersuche Then
+                LogWarn "Datei-Kopie Versuch " & intVersuch & "/" & intMaxVersuche & _
+                        ": " & strErr & " - Retry in " & lngPause & "ms", "FILEMANAGER"
+                Sleep lngPause
+                lngPause = lngPause * 2
+                If lngPause > 16000 Then lngPause = 16000
+            End If
+        End If
+    Next intVersuch
+
+    LogError "Datei-Kopie endgueltig fehlgeschlagen nach " & intMaxVersuche & _
+             " Versuchen: " & strQuelle, "FILEMANAGER"
+    KopiereNachNetzwerk = False
+    Exit Function
+
+ErrHandler:
+    HandleError "modFileManager", "KopiereNachNetzwerk"
+    KopiereNachNetzwerk = False
+End Function
+
+
+' ===========================================================================
+' HILFSFUNKTIONEN (privat)
+' ===========================================================================
+
+' KuerzeAbsender und RTrimSpecial -> zentralisiert in modStringUtils (v0.4)
+
+' Prueft ob ein VBA-Fehlercode ein Netzwerk-Problem anzeigt
+Private Function IstNetzwerkFehler(ByVal lngErrNum As Long) As Boolean
+    Select Case lngErrNum
+        Case 52     ' Bad file name or number
+        Case 53     ' File not found
+        Case 57     ' Device I/O error
+        Case 67     ' Too many files
+        Case 70     ' Permission denied
+        Case 71     ' Disk not ready
+        Case 75     ' Path/File access error
+        Case 76     ' Path not found
+        Case Else
+            IstNetzwerkFehler = False
+            Exit Function
+    End Select
+    IstNetzwerkFehler = True
+End Function
+
+' True wenn Pfad ein UNC-Pfad ist (\\Server\Share\...)
+Private Function IstUNCPfad(ByVal strPfad As String) As Boolean
+    Dim strNorm As String
+    strNorm = Trim$(Nz(strPfad, ""))
+    IstUNCPfad = (Len(strNorm) >= 2 And Left$(strNorm, 2) = "\\")
+End Function
+
+' True wenn Laufwerkspfad auf ein gemapptes Netzlaufwerk zeigt (z.B. Z:\...)
+Private Function IstGemapptesNetzlaufwerk(ByVal strPfad As String) As Boolean
+    On Error Resume Next
+
+    Dim strNorm As String
+    strNorm = NormalisierePfad(strPfad)
+    If Len(strNorm) < 3 Then Exit Function
+
+    If Mid$(strNorm, 2, 2) <> ":\" Then Exit Function
+
+    Dim strRoot As String
+    strRoot = Left$(strNorm, 3)
+
+    IstGemapptesNetzlaufwerk = (GetDriveTypeA(strRoot) = DRIVE_REMOTE)
+    On Error GoTo 0
+End Function
+
+' Oeffentlich: True fuer UNC oder gemapptes Netzlaufwerk
+Public Function IstNetzwerkPfad(ByVal strPfad As String) As Boolean
+    IstNetzwerkPfad = (IstUNCPfad(strPfad) Or IstGemapptesNetzlaufwerk(strPfad))
+End Function
+
+' Liefert stabilen Pruefpfad fuer Erreichbarkeit:
+' - UNC: nur bis \\Server\Share\
+' - Lokal: nur Laufwerkswurzel (z.B. C:\)
+Private Function HoleNetzwerkPruefpfad(ByVal strPfad As String) As String
+    Dim strNorm As String
+    strNorm = NormalisierePfad(strPfad)
+
+    If IstUNCPfad(strNorm) Then
+        Dim arr As Variant
+        arr = Split(strNorm, "\")
+
+        If UBound(arr) >= 3 Then
+            HoleNetzwerkPruefpfad = "\\" & arr(2) & "\" & arr(3) & "\"
+        Else
+            HoleNetzwerkPruefpfad = strNorm
+        End If
+    ElseIf Len(strNorm) >= 3 And Mid$(strNorm, 2, 2) = ":\" Then
+        HoleNetzwerkPruefpfad = Left$(strNorm, 3)
+    Else
+        HoleNetzwerkPruefpfad = strNorm
+    End If
+End Function
+
+
